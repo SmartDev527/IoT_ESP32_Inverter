@@ -1,15 +1,27 @@
 #define TINY_GSM_MODEM_SIM7600 // Define modem type
 
+#include <Wire.h>
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <HardwareSerial.h>
 #include <Adafruit_NeoPixel.h>
+// #include <LiquidCrystal_I2C.h>
+#include <LCD_I2C.h> // ESP32-compatible LCD I2C library
+#include "certificates.h"
 
 #define RGB_LED_PIN 48 // Adjust based on your ESP32-S3 board
 #define NUM_PIXELS 1   // Typically, onboard RGB LEDs have 1 pixel
 
 Adafruit_NeoPixel rgbLed(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
+// LCD1602 I2C Setup
+#define I2C_SDA 35 // Set custom SDA pin
+#define I2C_SCL 36 // Set custom SCL pin
+
+// LCD initialize
+LCD_I2C lcd(0x27, 16, 2); // Change 0x27 if needed
+
+#define SIM7600_PWR 21
 // SIM7600 Serial Configuration
 #define MODEM_TX 16
 #define MODEM_RX 17
@@ -29,7 +41,7 @@ HardwareSerial sim7600(1);
 #define SerialAT sim7600
 
 // See all AT commands, if wanted
-//#define DUMP_AT_COMMANDS
+#define DUMP_AT_COMMANDS
 
 // Define the serial console for debug prints, if needed
 #define TINY_GSM_DEBUG SerialMon
@@ -60,12 +72,14 @@ const char wifiPass[] = "YourWiFiPass";
 
 // MQTT details
 // EMQX MQTT Server Configuration
+const char *cert_name = "iot_inverter2.pem";
 const char *broker = "u008dd8e.ala.dedicated.aws.emqxcloud.com";
 const char *mqtt_server = "u008dd8e.ala.dedicated.aws.emqxcloud.com"; // Replace with EMQX server URL/IP
 const char *mqtt_user = "ESP32";
 const char *mqtt_pass = "12345";
 const char *mqtt_topic_send = "esp32_status";
 const char *mqtt_topic_recv = "server_cmd";
+const int mqtt_port = 8883; // MQTT over TLS port
 
 #ifdef DUMP_AT_COMMANDS
 #include <StreamDebugger.h>
@@ -74,6 +88,8 @@ TinyGsm modem(debugger);
 #else
 TinyGsm modem(SerialAT);
 #endif
+
+// TinyGsmClient client(modem);
 TinyGsmClient client(modem);
 PubSubClient mqtt(client);
 
@@ -100,10 +116,16 @@ void mqttCallback(char *topic, byte *payload, unsigned int len)
     {
       esp32_reply += (char)payload[i];
     }
-    rgbLed.setPixelColor(0, rgbLed.Color(ledStatus, 0, 0));
+    rgbLed.setPixelColor(0, rgbLed.Color(payload[0], payload[1], payload[2]));
 
     mqtt.publish(mqtt_topic_send, esp32_reply.c_str());
-    // mqtt.publish(mqtt_topic_send, ledStatus ? "1" : "0");
+
+    // Display message on LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MQTT Msg:");
+    lcd.setCursor(0, 1);
+    lcd.print((char *)payload);
   }
 }
 
@@ -135,22 +157,32 @@ void setup()
   rgbLed.begin();
   rgbLed.show(); // Initialize with LED off
   pinMode(LED_PIN, OUTPUT);
+  pinMode(SIM7600_PWR, OUTPUT);
 
-  // !!!!!!!!!!!
-  // Set your reset, enable, power pins here
-  // !!!!!!!!!!!
+  Wire.begin(I2C_SDA, I2C_SCL);
+  lcd.begin(); // Initialize LCD
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting...");
 
   SerialMon.println("Wait...");
+  // !!!!!!!!!!!
+  // Set your reset, enable, power pins here
+  digitalWrite(SIM7600_PWR, LOW);
+  delay(1500); // Hold power key low for 1s to reset
+  digitalWrite(SIM7600_PWR, HIGH);
+  delay(5000); // Wait for module to reboot
+  // !!!!!!!!!!!
 
   // Set GSM module baud rate
-  //TinyGsmAutoBaud(SerialAT, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
+  // TinyGsmAutoBaud(SerialAT, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
   SerialAT.begin(115200);
   delay(2000);
 
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
   SerialMon.println("Initializing modem...");
- // modem.restart();
+  // modem.restart();
   modem.init();
 
   String modemInfo = modem.getModemInfo();
@@ -163,18 +195,6 @@ void setup()
   {
     modem.simUnlock(GSM_PIN);
   }
-#endif
-
-#if TINY_GSM_USE_WIFI
-  // Wifi connection parameters must be set before waiting for the network
-  SerialMon.print(F("Setting SSID/password..."));
-  if (!modem.networkConnect(wifiSSID, wifiPass))
-  {
-    SerialMon.println(" fail");
-    delay(10000);
-    return;
-  }
-  SerialMon.println(" success");
 #endif
 
 #if TINY_GSM_USE_GPRS && defined TINY_GSM_MODEM_XBEE
@@ -215,7 +235,20 @@ void setup()
 #endif
 
   // MQTT Broker setup
-  mqtt.setServer(mqtt_server, 1883);
+  //  client.setCACert(root_ca); // Load CA certificate
+
+  // Upload CA certificate using AT+CCERTDOWN
+  if (!uploadCertificate())
+  {
+    Serial.println("Certificate upload failed");
+    return;
+  }
+// Configure SSL with AT+SSLCFG
+    if (!setupSSL()) {
+        Serial.println("SSL setup failed");
+        return;
+    }
+  mqtt.setServer(mqtt_server, mqtt_port);
   mqtt.setCallback(mqttCallback);
 }
 
@@ -257,7 +290,24 @@ void loop()
 #endif
   }
 
-  if (!mqtt.connected())
+  // if (!mqtt.connected())
+  // {
+  //   SerialMon.println("=== MQTT NOT CONNECTED ===");
+  //   // Reconnect every 10 seconds
+  //   uint32_t t = millis();
+  //   if (t - lastReconnectAttempt > 10000L)
+  //   {
+  //     lastReconnectAttempt = t;
+  //     if (mqttConnect())
+  //     {
+  //       lastReconnectAttempt = 0;
+  //     }
+  //   }
+  //   delay(2000);
+  //   return;
+  // }
+
+  if (!connectMQTT())
   {
     SerialMon.println("=== MQTT NOT CONNECTED ===");
     // Reconnect every 10 seconds
@@ -265,14 +315,102 @@ void loop()
     if (t - lastReconnectAttempt > 10000L)
     {
       lastReconnectAttempt = t;
-      if (mqttConnect())
+      if (connectMQTT())
       {
         lastReconnectAttempt = 0;
       }
     }
-    delay(5000);
+    delay(2000);
     return;
   }
 
+
   mqtt.loop();
 }
+
+bool setupSSL()
+{
+  // Configure SSL context (context ID 0)
+  modem.sendAT("+CSSLCFG=\"sslversion\",0,4"); // SSL version 4 = TLS 1.2
+  if (modem.waitResponse() != 1)
+  {
+    Serial.println("Failed to set SSL version");
+    return false;
+  }
+// Optional: Enable server verification
+  modem.sendAT("+CSSLCFG=\"authmode\",0,1"); // 1 = Verify server certificate
+  if (modem.waitResponse() != 1)
+  {
+    Serial.println("Failed to set auth mode");
+    return false;
+  }
+
+  modem.sendAT("+CSSLCFG=\"cacert\",0,\"",cert_name "\""); // Set CA certificate
+  if (modem.waitResponse() != 1)
+  {
+    Serial.println("Failed to set CA certificate");
+    return false;
+  }
+
+  
+
+  return true;
+}
+
+bool uploadCertificate()
+{
+  Serial.println("Checking existing certificates...");
+    modem.sendAT("+CCERTLIST");
+    
+    String response = "";
+    if (modem.waitResponse(2000L, response) != 1) {
+        Serial.println("Failed to list certificates");
+        return false;
+    }
+
+    // Check if "cacert.pem" exists in the response
+    if (response.indexOf(String("+CCERTLIST: \"") + cert_name + "\"") >= 0) {
+        Serial.println("Certificate '" + String(cert_name) + "' already exists, skipping upload.");
+        return true;  // Certificate exists, no need to upload
+    }
+
+    // If certificate doesn’t exist, upload it
+    Serial.println("Certificate '" + String(cert_name) + "' not found, uploading...");
+    modem.sendAT("+CCERTDOWN=\"", cert_name, "\",", strlen(root_ca));
+    if (modem.waitResponse(2000L, ">") != 1) {  // Wait for ">" prompt
+        Serial.println("Failed to get '>' prompt for certificate download");
+        return false;
+    }
+
+    // Send the certificate data after ">"
+    SerialAT.write(root_ca, strlen(root_ca));
+    if (modem.waitResponse(5000L) != 1) {  // Wait for OK after data
+        Serial.println("Failed to complete certificate upload");
+        return false;
+    }
+    Serial.println("Certificate uploaded successfully");
+    return true;
+}
+
+bool connectMQTT() {
+    String connectCmd = "+CMQTTCONNECT=0,\"tcp://";
+    connectCmd += mqtt_server;
+    connectCmd += ":";
+    connectCmd += mqtt_port;
+    connectCmd += "\",60,1";
+    if (strlen(mqtt_user) > 0) {
+        connectCmd += ",\"";
+        connectCmd += mqtt_user;
+        connectCmd += "\",\"";
+        connectCmd += mqtt_pass;
+        connectCmd += "\"";
+    }
+    modem.sendAT(connectCmd);
+    if (modem.waitResponse(10000L) != 1) {
+        Serial.println("Failed to connect to MQTT broker");
+        return false;
+    }
+    Serial.println("Connected to MQTT broker");
+    return true;
+}
+
