@@ -6,7 +6,7 @@
 #include <HardwareSerial.h>
 #include <Adafruit_NeoPixel.h>
 #include <LCD_I2C.h>
-#include <esp_task_wdt.h>  // Include ESP32 Watchdog Timer library
+#include <esp_task_wdt.h>
 #include "certificates.h"
 
 // Hardware pins
@@ -48,7 +48,8 @@ enum SetupState {
   STATE_CONNECT_MQTT,
   STATE_SUBSCRIBE_MQTT,
   STATE_RUNNING,
-  STATE_ERROR
+  STATE_ERROR,
+  STATE_STOPPED
 };
 
 // Configuration
@@ -62,7 +63,7 @@ const char *mqtt_topic_send = "esp32_status";
 const char *mqtt_topic_recv = "server_cmd";
 const int mqtt_port = 8883;
 const unsigned long MONITOR_INTERVAL = 5000;
-const uint32_t WDT_TIMEOUT = 10;  // Watchdog timeout in seconds
+const uint32_t WDT_TIMEOUT = 10;
 
 // Global variables
 SetupState currentState = STATE_INIT_MODEM;
@@ -70,7 +71,8 @@ int retryCount = 0;
 uint8_t ledStatus = 0;
 Adafruit_NeoPixel rgbLed(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 LCD_I2C lcd(0x27, 16, 2);
-String clientID = "ESP32_SIM7600_" + String(millis());
+String clientID = "";  // Will be set with IMEI + "_" + truncated timestamp
+String imei = "";      // Store IMEI globally for use in responses
 String incomingBuffer = "";
 unsigned long lastMonitorTime = 0;
 String pendingTopic = "";
@@ -82,48 +84,41 @@ int pendingPayloadLen = 0;
 void setup() {
   SerialMon.begin(115200);
   sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-  
-  // Configure existing WDT instead of re-initializing
+
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = WDT_TIMEOUT * 1000,  // Convert to milliseconds
-    .idle_core_mask = 0,               // Watch all cores
-    .trigger_panic = true              // Reset on timeout
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
   };
-  esp_task_wdt_reconfigure(&wdt_config);  // Reconfigure existing WDT
-  esp_task_wdt_add(NULL);                 // Add main task to WDT
+  esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
 
   pinMode(LED_PIN, OUTPUT);
   pinMode(SIM7600_PWR, OUTPUT);
   digitalWrite(SIM7600_PWR, LOW);
-  
-  // Replace delay with WDT-friendly wait
   unsigned long start = millis();
   while (millis() - start < 1500) {
     esp_task_wdt_reset();
-    delay(100);  // Short delay with periodic reset
+    delay(100);
   }
-  
   digitalWrite(SIM7600_PWR, HIGH);
   start = millis();
   while (millis() - start < 5000) {
     esp_task_wdt_reset();
-    delay(100);  // Short delay with periodic reset
+    delay(100);
   }
 
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.begin();
   lcd.backlight();
   lcd.print("Connecting...");
-
   rgbLed.begin();
   rgbLed.show();
 }
 
 void loop() {
-  // Feed the Watchdog Timer
   esp_task_wdt_reset();
 
-  // Process incoming data
   while (SerialAT.available()) {
     char c = SerialAT.read();
     incomingBuffer += c;
@@ -137,7 +132,11 @@ void loop() {
     case STATE_INIT_MODEM:
       if (tryStep("Initializing modem", modem.init())) {
         SerialMon.println("Modem initialized: " + modem.getModemInfo());
-        nextState(STATE_WAIT_NETWORK);
+        if (setClientIDWithIMEI()) {
+          nextState(STATE_WAIT_NETWORK);
+        } else {
+          nextState(STATE_ERROR);
+        }
       }
       break;
 
@@ -194,9 +193,33 @@ void loop() {
       SerialMon.println("Setup failed, halting...");
       lcd.clear();
       lcd.print("Setup Failed");
-      while (true) delay(1000);  // WDT will reset here
+      while (true) delay(1000);
+      break;
+
+    case STATE_STOPPED:
+      SerialMon.println("Device stopped by server command");
+      lcd.clear();
+      lcd.print("Device Stopped");
+      while (true) delay(1000);
       break;
   }
+}
+
+bool setClientIDWithIMEI() {
+  modem.sendAT("+CGSN");
+  if (modem.waitResponse(1000L, imei) != 1) {
+    SerialMon.println("Failed to retrieve IMEI");
+    return false;
+  }
+  imei.trim();
+  SerialMon.println("Retrieved IMEI: " + imei);
+  String timestamp = String(millis());
+  if (timestamp.length() > 5) {
+    timestamp = timestamp.substring(0, 5);  // Truncate to 5 digits
+  }
+  clientID = imei + "_" + timestamp;  // Client ID = IMEI + "_" + truncated timestamp
+  SerialMon.println("Client ID set to: " + clientID);
+  return true;
 }
 
 bool tryStep(const String& stepMsg, bool success) {
@@ -230,7 +253,7 @@ void retryState(const String& stepMsg) {
     unsigned long start = millis();
     while (millis() - start < RETRY_DELAY) {
       esp_task_wdt_reset();
-      delay(100);  // Short delay with periodic reset
+      delay(100);
     }
   }
 }
@@ -275,8 +298,6 @@ void monitorConnections() {
 
 void processURC(String urc) {
   urc.trim();
-  // SerialMon.println("URC: " + urc);
-
   if (urc.startsWith("+CMQTTRXSTART: 0,")) {
     messageInProgress = true;
     pendingTopic = "";
@@ -284,26 +305,15 @@ void processURC(String urc) {
     int commaIdx = urc.indexOf(',', 14);
     pendingTopicLen = urc.substring(14, commaIdx).toInt();
     pendingPayloadLen = urc.substring(commaIdx + 1).toInt();
-    // SerialMon.println("RXSTART: Topic Len=" + String(pendingTopicLen) + ", Payload Len=" + String(pendingPayloadLen));
   } else if (urc.startsWith("+CMQTTRXTOPIC: 0,")) {
-    // int expectedLen = urc.substring(13).toInt();
-    // SerialMon.println("RXTOPIC: Expected Topic Len=" + String(expectedLen));
   } else if (messageInProgress && !urc.startsWith("+") && pendingTopic == "") {
     pendingTopic = urc;
-    // SerialMon.println("Topic Received: " + pendingTopic + " (Len=" + String(pendingTopic.length()) + ")");
   } else if (urc.startsWith("+CMQTTRXPAYLOAD: 0,")) {
-    // int expectedLen = urc.substring(18).toInt();
-    // SerialMon.println("RXPAYLOAD: Expected Payload Len=" + String(expectedLen));
   } else if (messageInProgress && !urc.startsWith("+") && pendingTopic != "" && pendingPayload == "") {
     pendingPayload = urc;
-    // SerialMon.println("Payload Received: " + pendingPayload + " (Len=" + String(pendingPayload.length()) + ")");
   } else if (urc == "+CMQTTRXEND: 0") {
-    // SerialMon.println("RXEND: Topic=" + pendingTopic + ", Payload=" + pendingPayload);
     if (messageInProgress && pendingTopic != "" && pendingPayload != "") {
-      // SerialMon.println("Calling handleMessage...");
       handleMessage(pendingTopic, pendingPayload);
-    } else {
-      // SerialMon.println("Message incomplete: Topic=" + pendingTopic + ", Payload=" + pendingPayload);
     }
     messageInProgress = false;
     pendingTopic = "";
@@ -314,20 +324,19 @@ void processURC(String urc) {
 }
 
 void handleMessage(String topic, String payload) {
-  // SerialMon.printf("Message arrived [%s]: %s\n", topic.c_str(), payload.c_str());
+  if (topic != "server_cmd") return;
 
-  if (topic != "server_cmd") {
-    // SerialMon.println("Ignoring message from non-server_cmd topic: " + topic);
+  if (payload == "STOP_DEVICE") {
+    SerialMon.println("Received stop command from server");
+    nextState(STATE_STOPPED);
     return;
   }
 
   ledStatus = !ledStatus;
   digitalWrite(LED_PIN, ledStatus);
 
-  String reply = "I got your message: " + payload;
-  // SerialMon.println("Attempting to publish: " + reply);
+  String reply = imei + ": " + payload;  // Replace "I got your message" with IMEI
   if (publishMQTT(reply.c_str())) {
-    // SerialMon.println("Published response: " + reply);
     if (payload.length() >= 3) {
       rgbLed.setPixelColor(0, rgbLed.Color(payload[0], payload[1], payload[2]));
       rgbLed.show();
@@ -336,8 +345,6 @@ void handleMessage(String topic, String payload) {
     lcd.print("MQTT Msg:");
     lcd.setCursor(0, 1);
     lcd.print(payload.substring(0, 16));
-  } else {
-    // SerialMon.println("Failed to publish response");
   }
 }
 
@@ -356,30 +363,30 @@ bool uploadCertificate() {
 
   SerialAT.write(root_ca, strlen(root_ca));
   bool result = modem.waitResponse(5000L) == 1;
-  esp_task_wdt_reset();  // Feed WDT during long operation
+  esp_task_wdt_reset();
   return result;
 }
 
 bool setupSSL() {
-  modem.sendAT("+CSSLCFG=\"sslversion\",0,4"); // TLS 1.2
+  modem.sendAT("+CSSLCFG=\"sslversion\",0,4");
   if (modem.waitResponse() != 1) return false;
 
   modem.sendAT("+CSSLCFG=\"cacert\",0,\"", cert_name, "\"");
   if (modem.waitResponse() != 1) return false;
 
-  modem.sendAT("+CSSLCFG=\"authmode\",0,1"); // Verify server only
+  modem.sendAT("+CSSLCFG=\"authmode\",0,1");
   return modem.waitResponse() == 1;
 }
 
 bool setupMQTT() {
   modem.sendAT("+CMQTTSTART");
   if (modem.waitResponse(5000L, "+CMQTTSTART: 0") != 1) return false;
-  esp_task_wdt_reset();  // Feed WDT during long operation
+  esp_task_wdt_reset();
 
-  modem.sendAT("+CMQTTACCQ=0,\"", clientID.c_str(), "\",1"); // SSL enabled
+  modem.sendAT("+CMQTTACCQ=0,\"", clientID.c_str(), "\",1");
   if (modem.waitResponse() != 1) return false;
 
-  modem.sendAT("+CMQTTSSLCFG=0,0"); // Use SSL context 0
+  modem.sendAT("+CMQTTSSLCFG=0,0");
   return modem.waitResponse() == 1;
 }
 
@@ -395,7 +402,7 @@ bool connectMQTT() {
   cmd += "\"";
   modem.sendAT(cmd);
   bool result = modem.waitResponse(10000L, "+CMQTTCONNECT: 0,0") == 1;
-  esp_task_wdt_reset();  // Feed WDT during long operation
+  esp_task_wdt_reset();
   return result;
 }
 
@@ -421,7 +428,6 @@ bool subscribeMQTT() {
 }
 
 bool publishMQTT(const char* message) {
-  // SerialMon.println("publishMQTT: Setting topic...");
   modem.sendAT("+CMQTTTOPIC=0,", String(strlen(mqtt_topic_send)).c_str());
   if (modem.waitResponse(500L, ">") != 1) {
     SerialMon.println("publishMQTT: Failed to get '>' for topic");
@@ -433,7 +439,6 @@ bool publishMQTT(const char* message) {
     return false;
   }
 
-  // SerialMon.println("publishMQTT: Setting payload...");
   int msgLen = strlen(message);
   modem.sendAT("+CMQTTPAYLOAD=0,", String(msgLen).c_str());
   if (modem.waitResponse(500L, ">") != 1) {
@@ -446,10 +451,8 @@ bool publishMQTT(const char* message) {
     return false;
   }
 
-  // SerialMon.println("publishMQTT: Publishing...");
   modem.sendAT("+CMQTTPUB=0,1,60");
   if (modem.waitResponse(1000L, "+CMQTTPUB: 0,0") == 1) {
-    // SerialMon.println("publishMQTT: Success");
     return true;
   } else {
     SerialMon.println("publishMQTT: Publish failed");
@@ -461,7 +464,7 @@ bool disconnectMQTT() {
   SerialMon.println("Disconnecting MQTT...");
   modem.sendAT("+CMQTTDISC=0,120");
   bool result = modem.waitResponse(10000L, "+CMQTTDISC: 0,0") == 1;
-  esp_task_wdt_reset();  // Feed WDT during long operation
+  esp_task_wdt_reset();
   return result;
 }
 
@@ -469,6 +472,6 @@ bool stopMQTT() {
   SerialMon.println("Stopping MQTT service...");
   modem.sendAT("+CMQTTSTOP");
   bool result = modem.waitResponse(10000L, "+CMQTTSTOP: 0") == 1;
-  esp_task_wdt_reset();  // Feed WDT during long operation
+  esp_task_wdt_reset();
   return result;
 }
