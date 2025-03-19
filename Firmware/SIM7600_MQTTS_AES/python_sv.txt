@@ -1,0 +1,51 @@
+import paho.mqtt.client as mqtt
+import base64
+import time
+
+# MQTT settings
+broker = "u008dd8e.ala.dedicated.aws.emqxcloud.com"
+port = 8883
+username = "ESP32"
+password = "12345"
+topic = "firmware/update"
+client_id = "OTA_Server"
+
+# Firmware file
+firmware_file = "OTA_test.bin"  # Replace with your .bin file
+chunk_size = 512
+
+def on_connect(client, userdata, flags, rc):
+    print("Connected with result code " + str(rc))
+#client = mqtt.Client(client_id, transport="tcp")
+client = mqtt.Client(client_id=client_id, transport="tcp", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+client.username_pw_set(username, password)
+client.tls_set()  # Enable SSL/TLS
+client.on_connect = on_connect
+client.connect(broker, port)
+client.loop_start()
+
+# Read firmware file
+with open(firmware_file, "rb") as f:
+    firmware_data = f.read()
+    total_size = len(firmware_data)
+    print(f"Total firmware size: {total_size} bytes")
+
+    # Send START
+    print("Sending START")
+    client.publish(topic, f"START:{total_size}")
+    time.sleep(2)
+
+    # Send raw binary chunks
+    for i in range(0, total_size, chunk_size):
+        chunk = firmware_data[i:i + chunk_size]
+        print(f"Sending chunk {i // chunk_size + 1} ({len(chunk)} bytes)")
+        client.publish(topic, chunk, qos=1)  # Send as bytes
+        time.sleep(0.5)
+
+    # Send END
+    print("Sending END")
+    client.publish(topic, "END")
+    time.sleep(1)
+
+client.loop_stop()
+client.disconnect()
