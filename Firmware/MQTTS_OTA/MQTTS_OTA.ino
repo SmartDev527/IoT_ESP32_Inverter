@@ -73,6 +73,9 @@ enum SetupState {
 // Configuration
 const int MAX_RETRIES = 3;
 const int RETRY_DELAY = 2000;
+const size_t OTA_CHUNK_SIZE = 512;              // Base chunk size
+const size_t OTA_MAX_DATA_SIZE = OTA_CHUNK_SIZE - 4;  // Chunk size minus 4 bytes for chunk number
+
 const char *cert_name = "iot_inverter2.pem";
 const char *mqtt_server = "u008dd8e.ala.dedicated.aws.emqxcloud.com";
 const char *mqtt_user = "ESP32";
@@ -83,6 +86,7 @@ const char *mqtt_topic_firmware = "firmware/update";
 const int mqtt_port = 8883;
 const unsigned long MONITOR_INTERVAL = 5000;
 const uint32_t WDT_TIMEOUT = 30;
+const size_t CHUNK_SIZE = 508; // Configurable chunk size (e.g., 1024 bytes)
 
 // Global variables
 SetupState currentState = STATE_INIT_MODEM;
@@ -470,11 +474,11 @@ void handleMessage(String topic, String payload) {
     publishMQTT(decrypted.c_str());
     SerialMon.println("Sent decrypted message: " + decrypted);
 
-    String prefixedMessage = "ESP32_" + decrypted;
+    String prefixedMessage = imei + decrypted;
     String encryptedPrefixed = encryptMessage(prefixedMessage.c_str());
     if (encryptedPrefixed.length() > 0) {
       publishMQTT(encryptedPrefixed.c_str());
-      SerialMon.println("Sent encrypted 'ESP32_' prefixed message (Base64): " + encryptedPrefixed);
+      SerialMon.println("Sent encrypted 'IMEI' prefixed message (Base64): " + encryptedPrefixed);
     } else {
       SerialMon.println("Failed to encrypt prefixed message");
     }
@@ -783,7 +787,7 @@ void startOTA(uint32_t totalSize) {
   receivedChunks.clear();
   missingChunks.clear();
 
-  SerialMon.println("OTA started: Total size=" + String(totalSize));
+  SerialMon.println("OTA started: Total size=" + String(totalSize) + ", Chunk size=" + String(CHUNK_SIZE));
   publishMQTT("OTA:STARTED");
 }
 
@@ -859,9 +863,9 @@ void processOTAFirmware(const String& topic, byte* payload, unsigned int dataLen
     return;
   }
 
-  size_t chunkSize = decodedLen - 4;
-  if (chunkSize > 508) {
-    SerialMon.println("Chunk too large: " + String(chunkSize));
+  size_t chunkSize = decodedLen - 4; // Subtract 4 bytes for chunk number
+  if (chunkSize > OTA_MAX_DATA_SIZE) {
+    SerialMon.println("Chunk too large: " + String(chunkSize) + " exceeds " + String(CHUNK_SIZE));
     cleanupResources();
     otaInProgress = false;
     publishMQTT("OTA:ERROR:Chunk too large");
@@ -933,8 +937,8 @@ void finishOTA() {
 
 void checkMissingChunks() {
   missingChunks.clear();
-  unsigned long expectedChunks = otaReceivedSize / 512;
-  for (unsigned long i = 0; i <= expectedChunks; i++) {
+  unsigned long expectedChunks = otaReceivedSize / OTA_CHUNK_SIZE;  //
+  for (unsigned long i = 0; i < expectedChunks; i++) {
     if (!receivedChunks[i]) {
       missingChunks.push_back(i);
       String req = "OTA:REQUEST:" + String(i);
