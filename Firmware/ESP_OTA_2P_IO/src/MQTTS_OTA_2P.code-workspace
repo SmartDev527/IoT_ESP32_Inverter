@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../MQTTS_OTA_2P"
+		},
+		{
+			"name": "ESP_OTA_2P_IO",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

@@ -11,6 +11,7 @@
 #include "certificates.h"
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_ota_ops.h>
 #include <map>
 #include <vector>
 

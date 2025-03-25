@@ -3,6 +3,13 @@ import time
 import os
 import base64
 import struct
+import hashlib
+
+imei = "123456789012345"
+salt = "GESAS"
+hash = hashlib.sha256((imei + salt).encode()).digest()
+password = base64.b64encode(hash[:16]).decode()[:16]
+
 
 # MQTT settings
 broker = "u008dd8e.ala.dedicated.aws.emqxcloud.com"
