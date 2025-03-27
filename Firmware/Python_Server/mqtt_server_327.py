@@ -20,7 +20,7 @@ BROKER = "u008dd8e.ala.dedicated.aws.emqxcloud.com"
 PORT = 8883
 USERNAME = "ESP32"
 PASSWORD = "12345"
-CA_CERT = "C:/Users/Milad/Documents/OTA_Python_Server/emqx_ca.crt"
+CA_CERT = "C:/Users/Milad/Documents/OTA_Python_Server/emqx_ca.crt"  # Verify this matches ESP32's cert
 PROVISION_REQUEST_TOPIC = "dev_pass_req"
 PROVISION_RESPONSE_TOPIC = "dev_pass_res"
 OTA_TOPIC = "OTA_Update"
@@ -29,12 +29,9 @@ AES_KEY = bytes.fromhex("3031323334353637383941424344454630313233343536373839414
 AES_IV = bytes.fromhex("30313233343536373839414243444546")
 CHUNK_SIZE = 1024
 BATCH_SIZE = 10
-chunk_buffer = {}  # Buffer for all chunks
-MAX_RETRIES = 3
 
 # Global variables
 client = None
-provisioning_imei = None
 command_queue = queue.Queue()
 chunk_ack_event = threading.Event()
 last_chunk_sent = -1
@@ -62,8 +59,8 @@ def compute_firmware_hash(file_path):
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print("Connected to MQTT broker")
-        client.subscribe(PROVISION_REQUEST_TOPIC)
-        client.subscribe(STATUS_TOPIC)
+        client.subscribe(PROVISION_REQUEST_TOPIC, qos=1)  # Add QoS=1
+        client.subscribe(STATUS_TOPIC, qos=1)
         print(f"Subscribed to {PROVISION_REQUEST_TOPIC} and {STATUS_TOPIC}")
     else:
         print(f"Connection failed with code {rc}")
@@ -72,9 +69,13 @@ def on_message(client, userdata, msg):
     global last_chunk_sent
     payload = msg.payload.decode('utf-8')
     topic = msg.topic
-    print(f"Received on {topic}: {payload}")
+    print(f"Raw message received - Topic: {topic}, Payload: {payload}")  # Log all messages
 
-    if topic == STATUS_TOPIC:
+    if topic == PROVISION_REQUEST_TOPIC and payload.startswith("IMEI:"):
+        imei = payload.split(":")[1]
+        print(f"Provisioning request received for IMEI: {imei}")
+        command_queue.put(("provision", imei))
+    elif topic == STATUS_TOPIC:
         if payload.startswith("OTA:PROGRESS:"):
             parts = payload.split(":")
             if len(parts) >= 4:
@@ -136,7 +137,6 @@ def send_ota_firmware(file_path):
                 if not chunk:
                     break
                 if len(chunk) < CHUNK_SIZE and total_bytes_sent + len(chunk) < file_size:
-                    print(f"Warning: Chunk {chunk_num} is {len(chunk)} bytes, padding to {CHUNK_SIZE}")
                     chunk = chunk + b'\x00' * (CHUNK_SIZE - len(chunk))
                 chunk_data = chunk_num.to_bytes(4, byteorder='big') + chunk
                 encoded_chunk = base64.b64encode(chunk_data).decode('utf-8')
@@ -144,18 +144,6 @@ def send_ota_firmware(file_path):
                 
                 client.publish(OTA_TOPIC, encoded_chunk, qos=1)
                 print(f"Sent chunk {chunk_num} ({len(chunk)} bytes)")
-                last_chunk_sent = chunk_num
-                
-                for attempt in range(MAX_RETRIES):
-                    chunk_ack_event.clear()
-                    if chunk_ack_event.wait(timeout=15):
-                        break
-                    print(f"No acknowledgment for chunk {chunk_num}, retrying attempt {attempt + 1}")
-                    client.publish(OTA_TOPIC, encoded_chunk, qos=1)
-                    print(f"Resent chunk {chunk_num}")
-                else:
-                    print(f"Failed to send chunk {chunk_num} after {MAX_RETRIES} attempts")
-                    return
                 
                 total_bytes_sent += len(chunk)
                 chunk_num += 1
@@ -170,31 +158,29 @@ def send_ota_firmware(file_path):
     except Exception as e:
         print(f"Error during OTA: {e}")
 
-
 def input_handler():
-    global provisioning_imei
     print("Starting server... Enter 'cmd' for commands.")
     input_buffer = ""
     while True:
         if not command_queue.empty():
-            cmd_type, data = command_queue.get_nowait()
+            print("Processing command queue...")
+            cmd_type, data = command_queue.get()
+            print(f"Queue item: type={cmd_type}, data={data}")
             if cmd_type == "provision":
+                print(f"Processing provisioning for IMEI: {data}")
                 password = input(f"Provide password for ESP_{data}: ").strip()
                 if password:
                     response = f"PASSWORD:{password}"
                     encrypted_response = encrypt_message(response)
-                    client.publish(PROVISION_RESPONSE_TOPIC, encrypted_response)
+                    client.publish(PROVISION_RESPONSE_TOPIC, encrypted_response, qos=1)
                     print(f"Sent encrypted password: {encrypted_response}")
-                    provisioning_imei = None
                 command_queue.task_done()
         
         if platform.system() == "Windows":
             if msvcrt.kbhit():
                 char = msvcrt.getch().decode('utf-8')
-                print(f"Key pressed: '{char}'")
                 if char in ['\r', '\n']:
                     action = input_buffer.strip().lower()
-                    print(f"Action: '{action}'")
                     if action == "cmd":
                         command = input("Enter command ('OTA' or 'reverse old firmware'): ").strip().lower()
                         if command == "ota":
@@ -212,10 +198,8 @@ def input_handler():
         else:
             if select.select([sys.stdin], [], [], 0.1)[0]:
                 char = sys.stdin.read(1)
-                print(f"Key pressed: '{char}'")
                 if char in ['\n', '\r']:
                     action = input_buffer.strip().lower()
-                    print(f"Action: '{action}'")
                     if action == "cmd":
                         command = input("Enter command ('OTA' or 'reverse old firmware'): ").strip().lower()
                         if command == "ota":
@@ -234,7 +218,7 @@ def input_handler():
 
 def setup_mqtt():
     global client
-    client = mqtt.Client(client_id="ESP32_SIM7600_Client", protocol=mqtt.MQTTv311)
+    client = mqtt.Client(client_id="Python_Server_" + str(int(time.time())), protocol=mqtt.MQTTv311)
     client.username_pw_set(USERNAME, PASSWORD)
     client.tls_set(ca_certs=CA_CERT)
     client.on_connect = on_connect
@@ -249,10 +233,15 @@ def setup_mqtt():
     
     mqtt_thread = threading.Thread(target=client.loop_forever, daemon=True)
     mqtt_thread.start()
-    time.sleep(1)
     input_thread = threading.Thread(target=input_handler, daemon=True)
     input_thread.start()
-    input_thread.join()
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        client.disconnect()
 
 if __name__ == "__main__":
     setup_mqtt()

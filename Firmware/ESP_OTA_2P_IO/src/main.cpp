@@ -11,7 +11,7 @@
 #endif
 #include <esp_task_wdt.h>
 #include "mbedtls/aes.h"
-#include "mbedtls/sha256.h"  // Added for SHA256
+#include "mbedtls/sha256.h" // Added for SHA256
 #include "certificates.h"
 #include <esp_ota_ops.h>
 #include <map>
@@ -74,6 +74,7 @@ enum SetupState
     STATE_CONNECT_MQTT,
     STATE_SUBSCRIBE_MQTT,
     STATE_RUNNING,
+    STATE_WAIT_PROVISION,
     STATE_ERROR,
     STATE_STOPPED,
     STATE_RECOVER_NETWORK,
@@ -82,13 +83,13 @@ enum SetupState
 };
 
 // Configuration
-const int MAX_RETRIES = 3;
+const int MAX_RETRIES = 10;
 const int RETRY_DELAY = 2000;
 const size_t OTA_CHUNK_SIZE = 1028;
 const size_t OTA_MAX_DATA_SIZE = OTA_CHUNK_SIZE - 4;
-const int BATCH_SIZE = 10;                // Send 10 chunks per batch
-std::vector<unsigned long> batchChunks;   // Buffer for current batch
-unsigned long expectedBatchEnd = 0;       // Last chunk number in current batch
+const int BATCH_SIZE = 10;              // Send 10 chunks per batch
+std::vector<unsigned long> batchChunks; // Buffer for current batch
+unsigned long expectedBatchEnd = 0;     // Last chunk number in current batch
 
 const char *cert_name = "iot_inverter2.pem";
 const char *mqtt_server = "u008dd8e.ala.dedicated.aws.emqxcloud.com";
@@ -129,11 +130,15 @@ unsigned char encryptedBuffer[128];
 bool isProvisioned = false;
 Preferences preferences;
 bool factoryResetTriggered = false;
-bool waitingForProvisionResponse = false; // New flag to track provisioning wait
-unsigned long provisionTimeout = 30000;   // Timeout for provisioning response
+bool waitingForProvisionResponse = false;               // New flag to track provisioning wait
+unsigned long provisionTimeout = 1200000;               // Timeout for provisioning response
+unsigned long provisionStartTime = 0;                   // New variable to track request start time
+const unsigned long PROVISION_REQUEST_INTERVAL = 10000; // Retry request every 10 seconds
+unsigned long PROVISION_RESTART_TIMEOUT = 120000;       // Default restart timeout: 120 seconds (2 minutes)
 unsigned long lastRequestTime = 0;
-const unsigned long provisionReqTimeout = 10000; // 10 seconds
-
+static int publishRetryCount = 0;
+// Track subscription state for provisioning topic
+static bool provisionTopicSubscribed = false;
 // OTA variables
 bool otaInProgress = false;
 unsigned long otaReceivedSize = 0;
@@ -149,9 +154,8 @@ unsigned long validationDelay = 60000;
 bool pendingValidation = false;
 unsigned int mqttErrors = 0;
 bool mqttServiceStarted = false;
-String otaHash = "";  // Expected SHA256 hash from server
-mbedtls_sha256_context sha256_ctx;  // For computing received hash
-
+String otaHash = "";               // Expected SHA256 hash from server
+mbedtls_sha256_context sha256_ctx; // For computing received hash
 
 // Base64 encoding/decoding tables
 static const char base64_enc_map[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -188,7 +192,8 @@ bool setupSSL();
 bool setupMQTT();
 bool connectMQTT();
 bool subscribeMQTT();
-bool publishMQTT(const char *message);
+bool subscribeMQTT(const char *topic);
+bool publishMQTT(const char *topic, const char *message);
 bool disconnectMQTT();
 bool stopMQTT();
 void startOTA(uint32_t totalSize);
@@ -199,6 +204,7 @@ void revertToPreviousFirmware();
 void loadCredentials();
 void saveCredentials(String newPassword);
 bool requestCredentialsFromServer();
+bool republishProvisionRequest();
 void performFactoryReset();
 void resetCredentials();
 
@@ -286,240 +292,6 @@ size_t pkcs7_unpad(unsigned char *data, size_t data_len)
     return data_len - pad_value;
 }
 
-// Check running partition
-void check_firmware_partition()
-{
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    if (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY)
-    {
-        SerialMon.println("Running from factory partition");
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("Factory Mode");
-        }
-#endif
-    }
-    else if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ||
-             running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
-    {
-        SerialMon.printf("Running from OTA partition %d\n", running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0);
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("OTA Mode");
-        }
-#endif
-    }
-}
-
-void resetCredentials()
-{
-    preferences.begin("device-creds", false); // Open in read-write mode
-    preferences.clear();                      // Clear all key-value pairs in "device-creds"
-    preferences.end();
-
-    // Reset global variables to defaults
-    isProvisioned = false;
-    clientID = DEFAULT_CLIENT_ID;
-    mqtt_user = DEFAULT_USERNAME;
-    mqtt_pass = DEFAULT_PASSWORD;
-
-    SerialMon.println("Credentials reset to defaults");
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Creds Reset");
-    }
-#endif
-}
-
-// Load credentials from NVS
-void loadCredentials()
-{
-    preferences.begin("device-creds", true);
-    isProvisioned = preferences.getBool("provisioned", false);
-
-    if (isProvisioned)
-    {
-        clientID = preferences.getString("client_id", "GESUS_" + String(millis()));
-        mqtt_user = preferences.getString("username", "ESP32_" + imei);
-        mqtt_pass = preferences.getString("password", "");
-        if (mqtt_pass == "")
-        {
-            SerialMon.println("Warning: No saved password found, resetting to default");
-            isProvisioned = false;
-            clientID = DEFAULT_CLIENT_ID;
-            mqtt_user = DEFAULT_USERNAME;
-            mqtt_pass = DEFAULT_PASSWORD;
-        }
-    }
-    else
-    {
-        clientID = "GESUS_" + String(millis());
-        mqtt_user = "ESP32_" + imei;
-        mqtt_pass = DEFAULT_PASSWORD;
-    }
-
-    mqtt_user.replace("\r", "");
-    mqtt_user.replace("\n", "");
-    int okIndex = mqtt_user.indexOf("OK");
-    if (okIndex != -1)
-    {
-        mqtt_user = mqtt_user.substring(0, okIndex);
-    }
-    mqtt_user.trim();
-    mqtt_pass.replace("\r", "");
-    mqtt_pass.replace("\n", "");
-    mqtt_pass.trim();
-
-    preferences.end();
-    SerialMon.println("Loaded credentials:");
-    SerialMon.println("Client ID: " + clientID);
-    SerialMon.println("Username: " + mqtt_user);
-    SerialMon.println("Provisioned: " + String(isProvisioned ? "Yes" : "No"));
-}
-
-// Save credentials to NVS
-void saveCredentials(String newPassword)
-{
-    if (imei == "" || imei == "Unknown")
-    {
-        SerialMon.println("Cannot save credentials without valid IMEI");
-        return;
-    }
-
-    mqtt_user = "ESP32_" + imei;
-    mqtt_user.replace("\r", "");
-    mqtt_user.replace("\n", "");
-    int okIndex = mqtt_user.indexOf("OK");
-    if (okIndex != -1)
-    {
-        mqtt_user = mqtt_user.substring(0, okIndex);
-    }
-    mqtt_user.trim();
-
-    if (!isProvisioned)
-    {
-        clientID = "GESUS_" + String(millis());
-    }
-    mqtt_pass = newPassword;
-    mqtt_pass.replace("\r", "");
-    mqtt_pass.replace("\n", "");
-    mqtt_pass.trim();
-
-    preferences.begin("device-creds", false);
-    preferences.putString("client_id", clientID);
-    preferences.putString("username", mqtt_user);
-    preferences.putString("password", mqtt_pass);
-    preferences.putBool("provisioned", true);
-    preferences.end();
-
-    isProvisioned = true;
-    SerialMon.println("Saved new credentials:");
-    SerialMon.println("Client ID: " + clientID);
-    SerialMon.println("Username: " + mqtt_user);
-    SerialMon.println("Password length: " + String(mqtt_pass.length()));
-}
-
-// Request credentials from server
-bool requestCredentialsFromServer()
-{
-    if (imei == "" || imei == "Unknown")
-    {
-        SerialMon.println("No IMEI available for provisioning");
-        return false;
-    }
-
-    clientID = DEFAULT_CLIENT_ID;
-    mqtt_user = DEFAULT_USERNAME;
-    mqtt_pass = DEFAULT_PASSWORD;
-    SerialMon.println("Set provisioning credentials - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
-
-    if (!connectMQTT())
-    {
-        SerialMon.println("Failed to connect with default credentials");
-        return false;
-    }
-
-    // Subscribe to PROVISION_RESPONSE_TOPIC
-    modem.sendAT("+CMQTTSUBTOPIC=0,", String(strlen(PROVISION_RESPONSE_TOPIC)).c_str(), ",1");
-    if (modem.waitResponse(1000L, ">") != 1)
-    {
-        SerialMon.println("Failed to get prompt for SUBTOPIC");
-        disconnectMQTT();
-        return false;
-    }
-    SerialAT.print(PROVISION_RESPONSE_TOPIC);
-    if (modem.waitResponse(2000L) != 1)
-    {
-        SerialMon.println("Failed to send provision response topic");
-        disconnectMQTT();
-        return false;
-    }
-    modem.sendAT("+CMQTTSUB=0");
-    if (modem.waitResponse(2000L, "+CMQTTSUB: 0,0") != 1)
-    {
-        SerialMon.println("Failed to subscribe to " + String(PROVISION_RESPONSE_TOPIC));
-        disconnectMQTT();
-        return false;
-    }
-    SerialMon.println("Subscribed to " + String(PROVISION_RESPONSE_TOPIC));
-
-    // Publish provisioning request
-    String requestMsg = "IMEI:" + imei;
-    modem.sendAT("+CMQTTTOPIC=0,", String(strlen(PROVISION_TOPIC)).c_str());
-    if (modem.waitResponse(1000L, ">") != 1)
-    {
-        SerialMon.println("Failed to get prompt for TOPIC");
-        disconnectMQTT();
-        return false;
-    }
-    SerialAT.print(PROVISION_TOPIC);
-    if (modem.waitResponse(1000L) != 1)
-    {
-        SerialMon.println("Failed to send provision topic");
-        disconnectMQTT();
-        return false;
-    }
-    modem.sendAT("+CMQTTPAYLOAD=0,", String(requestMsg.length()).c_str());
-    if (modem.waitResponse(1000L, ">") != 1)
-    {
-        SerialMon.println("Failed to get prompt for PAYLOAD");
-        disconnectMQTT();
-        return false;
-    }
-    SerialAT.print(requestMsg);
-    if (modem.waitResponse(1000L) != 1)
-    {
-        SerialMon.println("Failed to send payload");
-        disconnectMQTT();
-        return false;
-    }
-    modem.sendAT("+CMQTTPUB=0,1,60");
-    if (modem.waitResponse(2000L, "+CMQTTPUB: 0,0") != 1)
-    {
-        SerialMon.println("Failed to publish credential request");
-        disconnectMQTT();
-        return false;
-    }
-
-    SerialMon.println("Requested credentials with IMEI: " + imei);
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Requesting Creds");
-    }
-#endif
-    waitingForProvisionResponse = true;
-    provisionTimeout = millis() + 30000; // Increase timeout to 30 seconds
-    return true;                         // Stay in STATE_SETUP_MQTT
-}
-
 void setup()
 {
     esp_task_wdt_reset();
@@ -559,7 +331,7 @@ void setup()
 
     rgbLed.begin();
     rgbLed.show();
-
+    resetCredentials();
     bootTime = millis();
 
     if (tryStep("Initializing modem", modem.init()))
@@ -574,26 +346,6 @@ void setup()
         }
         else
         {
-            // Debug raw response byte-by-byte
-            SerialMon.print("Raw IMEI bytes: ");
-            for (int i = 0; i < rawImei.length(); i++)
-            {
-                char c = rawImei[i];
-                if (c >= 32 && c <= 126)
-                {
-                    SerialMon.print(c);
-                }
-                else
-                {
-                    SerialMon.print("[0x");
-                    if (c < 16)
-                        SerialMon.print("0");
-                    SerialMon.print(c, HEX);
-                    SerialMon.print("]");
-                }
-            }
-            SerialMon.println();
-
             imei = rawImei;
             imei.replace("\r", "");
             imei.replace("\n", "");
@@ -652,7 +404,7 @@ void loop()
             else
             {
                 imei.trim();
-                SerialMon.println("Retrieved IMEI: " + imei);
+                // SerialMon.println("Retrieved IMEI: " + imei);
             }
             nextState(STATE_WAIT_NETWORK);
         }
@@ -687,38 +439,76 @@ void loop()
         break;
 
     case STATE_SETUP_MQTT:
-        if (!isProvisioned)
+        if (tryStep("Setting up MQTT", setupMQTT()))
         {
-            unsigned long currentTime = millis();
-            if (!waitingForProvisionResponse || (waitingForProvisionResponse && (currentTime - lastRequestTime >= provisionReqTimeout)))
+            if (!isProvisioned)
             {
-                if (tryStep("Setting up MQTT", setupMQTT()))
+                if (requestCredentialsFromServer())
                 {
-                    if (requestCredentialsFromServer())
-                    {
-                        SerialMon.println("Waiting for provisioning response...");
-                        waitingForProvisionResponse = true;
-                        lastRequestTime = currentTime; // Record time of request
-                    }
-                    else
-                    {
-                        nextState(STATE_ERROR);
-                    }
+                    nextState(STATE_WAIT_PROVISION);
+                }
+                else
+                {
+                    SerialMon.println("Failed to request provisioning credentials");
+                    nextState(STATE_ERROR);
                 }
             }
             else
-            {
-                SerialMon.println("Still waiting for provisioning response...");
-            }
-        }
-        else
-        {
-            if (tryStep("Setting up MQTT", setupMQTT()))
             {
                 nextState(STATE_CONNECT_MQTT);
             }
         }
         break;
+    case STATE_WAIT_PROVISION:
+    {
+        unsigned long currentTime = millis();
+
+        // Check for timeout
+        if (currentTime - provisionStartTime >= provisionTimeout)
+        {
+            SerialMon.println("Provisioning timeout exceeded");
+            waitingForProvisionResponse = false;
+            disconnectMQTT();
+            stopMQTT();
+            nextState(STATE_ERROR);
+            break;
+        }
+
+        // Retry request if interval elapsed
+        if (currentTime - lastRequestTime >= PROVISION_REQUEST_INTERVAL)
+        {
+            if (republishProvisionRequest())
+            {
+                SerialMon.println("Retried provisioning request");
+            }
+            else
+            {
+                SerialMon.println("Failed to retry provisioning request");
+                publishRetryCount++;
+                if (publishRetryCount >= MAX_RETRIES)
+                {
+                    nextState(STATE_ERROR);
+                }
+            }
+        }
+
+        // Status update
+        SerialMon.println("Waiting for provisioning response...");
+#ifdef ENABLE_LCD
+        if (lcdAvailable)
+        {
+            lcd.clear();
+            lcd.print("Waiting Provision");
+            lcd.setCursor(0, 1);
+            lcd.print((currentTime - provisionStartTime) / 1000);
+            lcd.print("s");
+        }
+#endif
+        rgbLed.setPixelColor(0, 255, 165, 0); // Orange while waiting
+        rgbLed.show();
+        delay(1000); // Reduce CPU usage while waiting
+        break;
+    }
     case STATE_CONNECT_MQTT:
         SerialMon.println("Before connect - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
         if (tryStep("Connecting to MQTT", connectMQTT()))
@@ -752,8 +542,9 @@ void loop()
             lcd.print("Error - Resetting");
         }
 #endif
-        delay(2000);
-        ESP.restart();
+        resetModem();
+        nextState(STATE_INIT_MODEM); // Retry from the beginning
+                                     // ESP.restart();
         break;
 
     case STATE_STOPPED:
@@ -912,15 +703,15 @@ void handleMessage(String topic, String payload)
         if (decrypted == "RESET_PASSWORD")
         {
             resetCredentials();
-            publishMQTT("Password reset requested");
+            publishMQTT(PROVISION_TOPIC, "Password reset requested");
             return;
         }
-        publishMQTT(decrypted.c_str());
+        publishMQTT(mqtt_topic_send, decrypted.c_str());
         String prefixedMessage = imei + decrypted;
         String encryptedPrefixed = encryptMessage(prefixedMessage.c_str());
         if (encryptedPrefixed.length() > 0)
         {
-            publishMQTT(encryptedPrefixed.c_str());
+            publishMQTT(mqtt_topic_send, encryptedPrefixed.c_str());
         }
         ledStatus = !ledStatus;
         digitalWrite(LED_PIN, ledStatus);
@@ -937,7 +728,7 @@ void handleMessage(String topic, String payload)
     else if (topic == PROVISION_RESPONSE_TOPIC && !isProvisioned && waitingForProvisionResponse)
     {
         String decrypted = decryptMessage(payload.c_str());
-        if (decrypted.startsWith("PASSWORD:"))
+      if (decrypted.startsWith("PASSWORD:"))
         {
             String newPassword = decrypted.substring(9);
             saveCredentials(newPassword);
@@ -949,18 +740,25 @@ void handleMessage(String topic, String payload)
                 SerialMon.println("Failed to stop MQTT, forcing full reset");
                 resetState();
                 nextState(STATE_INIT_MODEM);
-                // ESP.restart();
                 return;
             }
 
             waitingForProvisionResponse = false;
-            nextState(STATE_SETUP_MQTT); // Re-run setup with new credentials
-                                         //  ESP.restart();
+            provisionTopicSubscribed = false;  // Reset subscription flag
+            if (currentState == STATE_WAIT_PROVISION)
+            {
+                nextState(STATE_CONNECT_MQTT);
+            }
+            else
+            {
+                SerialMon.println("Unexpected state during provisioning: " + String(currentState));
+                nextState(STATE_SETUP_MQTT);
+            }
         }
         else
         {
             SerialMon.println("Invalid provisioning response");
-            waitingForProvisionResponse = false;
+           // waitingForProvisionResponse = false;
             nextState(STATE_ERROR);
         }
     }
@@ -1027,6 +825,7 @@ void resetModem()
     delay(1500);
     digitalWrite(SIM7600_PWR, HIGH);
     delay(5000);
+    mqttServiceStarted = false; // Reset flag since modem is restarted
 }
 
 void resetState()
@@ -1060,7 +859,7 @@ void monitorConnections()
         {
             SerialMon.println("OTA interrupted by network loss");
             cleanupResources();
-            publishMQTT("OTA:ERROR:Network lost");
+            publishMQTT(mqtt_topic_send, "OTA:ERROR:Network lost");
         }
         nextState(STATE_RECOVER_NETWORK);
     }
@@ -1071,7 +870,7 @@ void monitorConnections()
         {
             SerialMon.println("OTA interrupted by GPRS loss");
             cleanupResources();
-            publishMQTT("OTA:ERROR:GPRS lost");
+            publishMQTT(mqtt_topic_send, "OTA:ERROR:GPRS lost");
         }
         nextState(STATE_RECOVER_GPRS);
     }
@@ -1096,15 +895,38 @@ void cleanupResources()
     incomingBuffer = "";
     pendingTopic = "";
     pendingPayload = "";
+    publishRetryCount = 0;  // Reset on success
     waitingForProvisionResponse = false; // Reset provisioning flag
 }
 
 void processURC(String urc)
 {
     urc.trim();
-    SerialMon.println("URC: " + urc); // Debug URCs
-
-    if (urc.startsWith("+CMQTTRXSTART: 0,"))
+    if (urc.length() > 0)  // Avoid logging empty URCs
+    {
+        SerialMon.println("URC: " + urc);
+    }
+    if (urc.startsWith("+CMQTTSUB: 0,0"))
+    {
+        SerialMon.println("Subscription confirmed via URC");
+        if (!provisionTopicSubscribed && waitingForProvisionResponse)
+        {
+            provisionTopicSubscribed = true;
+            SerialMon.println("Late subscription confirmation for " + String(PROVISION_RESPONSE_TOPIC));
+        }
+    }
+    else if (urc.startsWith("+CMQTTRXSTART: 0,"))
+    {
+        // Handle incoming message as before
+        messageInProgress = true;
+        pendingTopic = "";
+        pendingPayload = "";
+        int commaIdx = urc.indexOf(',', 14);
+        pendingTopicLen = urc.substring(14, commaIdx).toInt();
+        pendingPayloadLen = urc.substring(commaIdx + 1).toInt();
+        SerialMon.println("Message start - Topic Len: " + String(pendingTopicLen) + ", Payload Len: " + String(pendingPayloadLen));
+    }
+    else if (urc.startsWith("+CMQTTRXSTART: 0,"))
     {
         messageInProgress = true;
         pendingTopic = "";
@@ -1145,6 +967,7 @@ void processURC(String urc)
     {
         if (messageInProgress && pendingTopic != "" && pendingPayload != "")
         {
+            SerialMon.println("Handling message - Topic: " + pendingTopic + ", Payload: " + pendingPayload);
             handleMessage(pendingTopic, pendingPayload);
         }
         messageInProgress = false;
@@ -1152,6 +975,16 @@ void processURC(String urc)
         pendingPayload = "";
         pendingTopicLen = 0;
         pendingPayloadLen = 0;
+    }
+    else if (urc.startsWith("+CMQTTCONNLOST: 0,"))
+    {
+        SerialMon.println("MQTT connection lost detected");
+        if (currentState == STATE_WAIT_PROVISION || currentState == STATE_RUNNING)
+        {
+            disconnectMQTT();
+            stopMQTT();
+            nextState(STATE_RECOVER_MQTT);  // Attempt to recover the connection
+        }
     }
 }
 
@@ -1187,24 +1020,63 @@ bool setupSSL()
 
 bool setupMQTT()
 {
-    SerialAT.println("AT+CMQTTSTART");
-    if (modem.waitResponse(5000L, "+CMQTTSTART: 0") != 1)
+    if (!mqttServiceStarted)
     {
-        SerialMon.println("MQTT start failed");
-        return false;
+        SerialAT.println("AT+CMQTTSTART");
+        String response = "";
+        int8_t res = modem.waitResponse(5000L, response);
+        response.trim();
+        SerialMon.println("MQTT start response: " + response);
+
+        if (response.indexOf("+CMQTTSTART: 0") >= 0)
+        {
+            mqttServiceStarted = true;
+            SerialMon.println("MQTT service started successfully");
+        }
+        else if (response.indexOf("+CMQTTSTART: 23") >= 0)
+        {
+            mqttServiceStarted = true;
+            SerialMon.println("MQTT service already running (+CMQTTSTART: 23), proceeding");
+        }
+        else
+        {
+            if (response.length() > 0)
+            {
+                SerialMon.println("MQTT start failed with response: " + response);
+            }
+            else
+            {
+                SerialMon.println("No response to AT+CMQTTSTART within timeout");
+            }
+            return false;
+        }
+    }
+    else
+    {
+        SerialMon.println("MQTT service already started, skipping AT+CMQTTSTART");
     }
 
+    // Generate trimmed dynamic clientID
+    unsigned long timeVal = millis() & 0xFFF;  // 0-4095, max 4 digits
+    clientID = "ESP32_" + String(timeVal);
+    SerialMon.println("Generated clientID: " + clientID);
+
+    // Acquire MQTT client
     char accqCmd[64];
     snprintf(accqCmd, sizeof(accqCmd), "AT+CMQTTACCQ=0,\"%s\",1", clientID.c_str());
     SerialMon.println("Sending: " + String(accqCmd));
     SerialAT.println(accqCmd);
-    if (modem.waitResponse(2000L) != 1)
+    String accqResponse;
+    if (modem.waitResponse(2000L, accqResponse) != 1)
     {
-        SerialMon.println("Failed to acquire MQTT client");
+        accqResponse.trim();
+        SerialMon.println("Failed to acquire MQTT client - Response: " + accqResponse);
         return false;
     }
+    SerialMon.println("MQTT client acquired successfully");
 
-    SerialAT.println("AT+CMQTTSSLCFG=0,0"); // Link SSL context 0 to MQTT client 0
+    // Configure SSL
+    SerialAT.println("AT+CMQTTSSLCFG=0,0");
     if (modem.waitResponse(2000L) != 1)
     {
         SerialMon.println("Failed to configure SSL for MQTT");
@@ -1218,6 +1090,16 @@ bool setupMQTT()
 
 bool connectMQTT()
 {
+    if (!mqttServiceStarted)
+    {
+        SerialMon.println("MQTT service not started, attempting setup...");
+        if (!setupMQTT())
+        {
+            SerialMon.println("Failed to start MQTT service before connecting");
+            return false;
+        }
+    }
+
     SerialMon.println("Before connect - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
 
     // Failsafe cleaning
@@ -1249,19 +1131,6 @@ bool connectMQTT()
         return false;
     }
 
-    SerialMon.print("Command length: ");
-    SerialMon.println(len);
-    SerialMon.print("Raw command bytes: ");
-    for (int i = 0; i < len; i++)
-    {
-        SerialMon.print(cmd[i]);
-        if (cmd[i] == '\n' || cmd[i] == '\r')
-        {
-            SerialMon.print(" [NEWLINE] ");
-        }
-    }
-    SerialMon.println();
-    SerialMon.print("Sending AT command: ");
     SerialMon.println(cmd);
     SerialAT.println(cmd);
 
@@ -1310,68 +1179,149 @@ bool connectMQTT()
     return false;
 }
 
-bool subscribeMQTT()
+bool subscribeMQTT(const char *topic)
 {
-    modem.sendAT("+CMQTTSUBTOPIC=0,", String(strlen(mqtt_topic_recv)).c_str(), ",1");
-    if (modem.waitResponse(500L, ">") != 1)
+    if (!topic || strlen(topic) == 0)
+    {
+        SerialMon.println("Invalid topic for subscription");
         return false;
-    SerialAT.print(mqtt_topic_recv);
-    if (modem.waitResponse(500L) != 1)
-        return false;
-    modem.sendAT("+CMQTTSUB=0");
-    if (modem.waitResponse(1000L, "+CMQTTSUB: 0,0") != 1)
-        return false;
-    SerialMon.println("Subscribed to: " + String(mqtt_topic_recv));
+    }
 
-    modem.sendAT("+CMQTTSUBTOPIC=0,", String(strlen(mqtt_topic_firmware)).c_str(), ",1");
+    modem.sendAT("+CMQTTSUBTOPIC=0,", String(strlen(topic)).c_str(), ",1");
     if (modem.waitResponse(500L, ">") != 1)
+    {
+        SerialMon.println("Failed to set subscription topic: " + String(topic));
         return false;
-    SerialAT.print(mqtt_topic_firmware);
+    }
+    SerialAT.print(topic);
     if (modem.waitResponse(500L) != 1)
+    {
+        SerialMon.println("Topic write failed for: " + String(topic));
         return false;
-    modem.sendAT("+CMQTTSUB=0");
-    if (modem.waitResponse(1000L, "+CMQTTSUB: 0,0") != 1)
-        return false;
-    SerialMon.println("Subscribed to: " + String(mqtt_topic_firmware));
+    }
 
-    return true;
+    modem.sendAT("+CMQTTSUB=0");
+    String response;
+    // Increase timeout to 5000ms to allow URC to arrive
+    int8_t res = modem.waitResponse(5000L, response);
+    response.trim();
+    SerialMon.println("Subscription response: " + response);
+
+    if (res == 1 && (response.indexOf("OK") >= 0 || response.indexOf("+CMQTTSUB: 0,0") >= 0))
+    {
+        SerialMon.println("Subscribed to: " + String(topic) + " (awaiting URC confirmation if not immediate)");
+        return true;  // Accept OK and handle URC later if delayed
+    }
+    else
+    {
+        SerialMon.println("Failed to subscribe to: " + String(topic) + " - Response: " + response);
+        return false;
+    }
 }
 
-bool publishMQTT(const char *message)
+bool subscribeMQTT()
 {
-    modem.sendAT("+CMQTTTOPIC=0,", String(strlen(mqtt_topic_send)).c_str());
+    bool success = true;
+    success &= subscribeMQTT(mqtt_topic_recv);
+    success &= subscribeMQTT(mqtt_topic_firmware);
+    return success;
+}
+
+bool publishMQTT(const char *topic, const char *message)
+{
+    if (!mqttServiceStarted || !connectMQTT())
+    {
+        SerialMon.println("Cannot publish: MQTT service not started or not connected");
+        return false;
+    }
+    if (!topic || !message)
+        return false;
+
+    // Set topic
+    modem.sendAT("+CMQTTTOPIC=0,", String(strlen(topic)).c_str());
     if (modem.waitResponse(500L, ">") != 1)
+    {
+        SerialMon.println("Failed to set topic: " + String(topic));
         return false;
-    SerialAT.print(mqtt_topic_send);
+    }
+    SerialAT.print(topic);
     if (modem.waitResponse(500L) != 1)
+    {
+        SerialMon.println("Topic write failed");
         return false;
+    }
+
+    // Set payload
     int msgLen = strlen(message);
     modem.sendAT("+CMQTTPAYLOAD=0,", String(msgLen).c_str());
     if (modem.waitResponse(500L, ">") != 1)
+    {
+        SerialMon.println("Failed to set payload length");
         return false;
+    }
     SerialAT.print(message);
     if (modem.waitResponse(500L) != 1)
+    {
+        SerialMon.println("Payload write failed");
         return false;
+    }
+
+    // Publish
     modem.sendAT("+CMQTTPUB=0,1,60");
-    return modem.waitResponse(1000L, "+CMQTTPUB: 0,0") == 1;
+    String response;
+    bool success = false;
+    // Wait for response with a longer timeout to catch asynchronous URCs
+    if (modem.waitResponse(2000L, response) == 1)
+    {
+        response.trim();
+        SerialMon.println("Publish response: " + response);
+        // Check for either OK or +CMQTTPUB: 0,0
+        if (response.indexOf("OK") >= 0 || response.indexOf("+CMQTTPUB: 0,0") >= 0)
+        {
+            success = true;
+            SerialMon.println("Published to " + String(topic) + ": " + String(message));
+        }
+    }
+
+    if (!success)
+    {
+        SerialMon.println("Failed to publish to " + String(topic) + " - Response: " + response);
+        // Check for asynchronous +CMQTTPUB: 0,0 in URCs later
+        SerialMon.println("Note: +CMQTTPUB: 0,0 may arrive asynchronously via URC");
+    }
+    return success;
 }
 
 bool disconnectMQTT()
 {
+    if (!mqttServiceStarted)
+    {
+        SerialMon.println("MQTT service not started, no need to disconnect");
+        return true; // Not an error if already disconnected
+    }
     SerialMon.println("Disconnecting MQTT...");
     modem.sendAT("+CMQTTDISC=0,120");
-    return modem.waitResponse(10000L, "+CMQTTDISC: 0,0") == 1;
+    bool success = modem.waitResponse(10000L, "+CMQTTDISC: 0,0") == 1;
+    if (!success)
+        SerialMon.println("Failed to disconnect MQTT");
+    return success;
 }
 
 bool stopMQTT()
 {
+   if (!mqttServiceStarted)
+    {
+        SerialMon.println("MQTT service already stopped");
+        return true;
+    }
     modem.sendAT("+CMQTTSTOP");
     if (modem.waitResponse(10000L, "+CMQTTSTOP: 0") != 1)
     {
         SerialMon.println("MQTT stop returned error, continuing cleanup");
         return false;
     }
-    mqttServiceStarted = false; // Reset flag
+    mqttServiceStarted = false;
+    provisionTopicSubscribed = false;
     SerialMon.println("MQTT service stopped");
     return true;
 }
@@ -1383,14 +1333,14 @@ void startOTA(uint32_t totalSize)
     if (!updatePartition)
     {
         SerialMon.println("No valid OTA partition available");
-        publishMQTT("OTA:ERROR:No partition");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:No partition");
         return;
     }
     esp_err_t err = esp_ota_begin(updatePartition, totalSize, &otaHandle);
     if (err != ESP_OK)
     {
         SerialMon.printf("OTA begin failed: %s\n", esp_err_to_name(err));
-        publishMQTT("OTA:ERROR:Begin failed");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Begin failed");
         return;
     }
     otaInProgress = true;
@@ -1401,24 +1351,31 @@ void startOTA(uint32_t totalSize)
     receivedChunks.clear();
     missingChunks.clear();
     mbedtls_sha256_init(&sha256_ctx);
-    mbedtls_sha256_starts(&sha256_ctx, 0);  // 0 for SHA256
+    mbedtls_sha256_starts(&sha256_ctx, 0); // 0 for SHA256
     SerialMon.println("OTA started from " + String(previousPartition->label) +
                       " to " + String(updatePartition->label));
-    publishMQTT("OTA:STARTED");
+    publishMQTT(mqtt_topic_send, "OTA:STARTED");
 }
 
-void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen) {
+void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen)
+{
     SerialMon.println("ENTER processOTAFirmware");
-    SerialMon.print("Topic: ["); SerialMon.print(topic); SerialMon.print("], Length: "); SerialMon.println(dataLen);
+    SerialMon.print("Topic: [");
+    SerialMon.print(topic);
+    SerialMon.print("], Length: ");
+    SerialMon.println(dataLen);
 
-    if (topic != mqtt_topic_firmware) {
+    if (topic != mqtt_topic_firmware)
+    {
         SerialMon.println("Ignoring OTA message: wrong topic");
         return;
     }
 
     String payloadStr((char *)payload, dataLen);
-    if (payloadStr.startsWith("OTA:BEGIN:")) {
-        if (otaInProgress || pendingValidation) {
+    if (payloadStr.startsWith("OTA:BEGIN:"))
+    {
+        if (otaInProgress || pendingValidation)
+        {
             SerialMon.println("Previous OTA detected, cleaning up...");
             cleanupResources();
         }
@@ -1427,31 +1384,48 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
         otaHash = payloadStr.substring(colonIdx + 1);
         SerialMon.println("Starting OTA with total size: " + String(totalSize) + ", hash: " + otaHash);
         startOTA(totalSize);
-        publishMQTT("OTA:STARTED");
+        publishMQTT(mqtt_topic_send, "OTA:STARTED");
         return;
     }
 
-    if (!otaInProgress) {
+    if (!otaInProgress)
+    {
         SerialMon.println("Ignoring OTA message: OTA not started");
         return;
     }
 
-    if (pendingValidation) {
+    if (pendingValidation)
+    {
         SerialMon.println("Ignoring OTA message: OTA pending validation");
         return;
     }
 
-    if (payloadStr == "OTA:END") {
+    if (payloadStr == "OTA:END")
+    {
         SerialMon.println("Received OTA:END");
         finishOTA();
         return;
     }
-
+    if (payloadStr == "OTA:CANCEL")
+    {
+        if (otaInProgress)
+        {
+            SerialMon.println("Cancelling ongoing OTA update");
+            cleanupResources(); // Reset OTA state, free resources
+            publishMQTT(mqtt_topic_firmware, "OTA:CANCELLED");
+        }
+        else
+        {
+            SerialMon.println("No OTA in progress to cancel");
+        }
+        return;
+    }
     // Decode base64 chunk
     size_t maxDecodedLen = ((dataLen + 3) / 4) * 3;
     unsigned char *decodedPayload = new unsigned char[maxDecodedLen];
     size_t decodedLen = base64_decode((char *)payload, decodedPayload, maxDecodedLen);
-    if (decodedLen < 4) {
+    if (decodedLen < 4)
+    {
         SerialMon.println("Invalid decoded chunk size: " + String(decodedLen) + ", raw payload: " + payloadStr.substring(0, 50));
         delete[] decodedPayload;
         return;
@@ -1463,23 +1437,26 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
                              decodedPayload[3];
     size_t chunkSize = decodedLen - 4;
 
-    if (chunkSize > OTA_MAX_DATA_SIZE) {
+    if (chunkSize > OTA_MAX_DATA_SIZE)
+    {
         SerialMon.println("Chunk too large: " + String(chunkSize) + " for chunk " + String(chunkNum));
         delete[] decodedPayload;
         return;
     }
 
-    if (receivedChunks[chunkNum]) {
+    if (receivedChunks[chunkNum])
+    {
         SerialMon.println("Duplicate chunk " + String(chunkNum));
         delete[] decodedPayload;
         return;
     }
 
     esp_err_t err = esp_ota_write(otaHandle, decodedPayload + 4, chunkSize);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         SerialMon.printf("OTA write failed for chunk %lu: %s\n", chunkNum, esp_err_to_name(err));
         cleanupResources();
-        publishMQTT("OTA:ERROR:Write failed");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Write failed");
         delete[] decodedPayload;
         return;
     }
@@ -1491,29 +1468,56 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
     SerialMon.println("Processed chunk " + String(chunkNum) + ", size=" + String(chunkSize));
 
     // Send acknowledgment for every chunk
-    String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize);
-    if (publishMQTT(ackMsg.c_str())) {
-        SerialMon.println("Sent acknowledgment: " + ackMsg);
-    } else {
-        SerialMon.println("Failed to send acknowledgment: " + ackMsg);
+    // String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize);
+    // if (publishMQTT(mqtt_topic_send, ackMsg.c_str()))
+    // {
+    //     SerialMon.println("Sent acknowledgment: " + ackMsg);
+    // }
+    // else
+    // {
+    //     SerialMon.println("Failed to send acknowledgment: " + ackMsg);
+    // }
+
+    static int chunksSinceAck = 0;
+    chunksSinceAck++;
+    if (chunksSinceAck >= BATCH_SIZE)
+    { // Acknowledge every 5 chunks
+        String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize);
+        publishMQTT(mqtt_topic_firmware, ackMsg.c_str());
+        chunksSinceAck = 0;
     }
 
     delete[] decodedPayload;
 }
 
-void finishOTA() {
-    if (!otaInProgress) {
+void finishOTA()
+{
+    if (!otaInProgress)
+    {
         SerialMon.println("No OTA in progress to finish");
         return;
     }
 
-    // Check for missing chunks
-    checkMissingChunks();
+    // Retry missing chunks up to 3 times
+    const int MAX_CHUNK_RETRIES = 3;
+    int retryCount = 0;
+    while (retryCount < MAX_CHUNK_RETRIES)
+    {
+        checkMissingChunks();
+        if (otaReceivedSize == otaTotalSize)
+        {
+            break; // All chunks received
+        }
+        SerialMon.println("Missing chunks detected, retry " + String(retryCount + 1) + "/" + String(MAX_CHUNK_RETRIES));
+        delay(5000); // Wait for server to resend
+        retryCount++;
+    }
 
-    if (otaReceivedSize != otaTotalSize) {
+    if (otaReceivedSize != otaTotalSize)
+    {
         SerialMon.println("OTA incomplete: Received " + String(otaReceivedSize) + "/" + String(otaTotalSize));
         cleanupResources();
-        publishMQTT("OTA:ERROR:Incomplete");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Incomplete");
         return;
     }
 
@@ -1521,56 +1525,68 @@ void finishOTA() {
     mbedtls_sha256_finish(&sha256_ctx, hash);
     mbedtls_sha256_free(&sha256_ctx);
     String computedHash = "";
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 32; i++)
+    {
         char hex[3];
         sprintf(hex, "%02x", hash[i]);
         computedHash += hex;
     }
-    if (computedHash != otaHash) {
+    if (computedHash != otaHash)
+    {
         SerialMon.println("Hash mismatch: " + computedHash + " vs " + otaHash);
         cleanupResources();
-        publishMQTT("OTA:ERROR:Hash mismatch");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Hash mismatch");
+        publishMQTT(mqtt_topic_send, "OTA:REQUEST:RETRY"); // Request retry
         return;
     }
 
     esp_err_t err = esp_ota_end(otaHandle);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         SerialMon.printf("OTA end failed: %s\n", esp_err_to_name(err));
         cleanupResources();
-        publishMQTT("OTA:ERROR:End failed");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:End failed");
         return;
     }
+    SerialMon.println("OTA update written, validating...");
+    publishMQTT(mqtt_topic_send, "OTA:SUCCESS:PENDING_VALIDATION");
+    pendingValidation = true; // Set flag
+    delay(10000);             // Wait for server confirmation
     err = esp_ota_set_boot_partition(updatePartition);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         SerialMon.printf("OTA set boot partition failed: %s\n", esp_err_to_name(err));
-        cleanupResources();
-        publishMQTT("OTA:ERROR:Set boot failed");
+        publishMQTT(mqtt_topic_firmware, "OTA:ERROR:Set boot failed");
         return;
     }
-    SerialMon.println("OTA update successful, restarting to " + String(updatePartition->label));
-    publishMQTT("OTA:SUCCESS:PENDING_VALIDATION");
+    SerialMon.println("OTA successful, restarting...");
     delay(1000);
     otaInProgress = false;
-    pendingValidation = true;
     ESP.restart();
 }
 
-void checkMissingChunks() {
+void checkMissingChunks()
+{
     SerialMon.println("Checking for missing chunks...");
     unsigned long expectedChunks = (otaTotalSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
     String missingMsg = "OTA:REQUEST:";
     bool hasMissing = false;
-    for (unsigned long i = 0; i < expectedChunks; i++) {
-        if (!receivedChunks[i]) {
+    for (unsigned long i = 0; i < expectedChunks; i++)
+    {
+        if (!receivedChunks[i])
+        {
             missingMsg += String(i) + ",";
             hasMissing = true;
         }
     }
-    if (hasMissing) {
+    if (hasMissing)
+    {
         missingMsg.remove(missingMsg.length() - 1); // Remove trailing comma
         SerialMon.println("Requesting missing chunks: " + missingMsg);
-        publishMQTT(missingMsg.c_str());
-    } else {
+        publishMQTT(mqtt_topic_send, missingMsg.c_str());
+    }
+    else
+    {
         SerialMon.println("No missing chunks detected");
     }
 }
@@ -1580,26 +1596,26 @@ void revertToPreviousFirmware()
     if (previousPartition == NULL)
     {
         SerialMon.println("No previous partition known");
-        publishMQTT("REVERT:ERROR:No previous partition");
+        publishMQTT(mqtt_topic_send, "REVERT:ERROR:No previous partition");
         return;
     }
     const esp_partition_t *current = esp_ota_get_running_partition();
     if (current == previousPartition)
     {
         SerialMon.println("Already running previous firmware");
-        publishMQTT("REVERT:ERROR:Already on previous");
+        publishMQTT(mqtt_topic_send, "REVERT:ERROR:Already on previous");
         return;
     }
     esp_err_t err = esp_ota_set_boot_partition(previousPartition);
     if (err != ESP_OK)
     {
         SerialMon.printf("Failed to set boot partition: %s\n", esp_err_to_name(err));
-        publishMQTT("REVERT:ERROR:Set failed");
+        publishMQTT(mqtt_topic_send, "REVERT:ERROR:Set failed");
         return;
     }
     SerialMon.println("Reverting to previous firmware: " + String(previousPartition->label));
     String revertMsg = String("REVERT:SUCCESS:") + String(previousPartition->label);
-    publishMQTT(revertMsg.c_str());
+    publishMQTT(mqtt_topic_send, revertMsg.c_str());
 #ifdef ENABLE_LCD
     if (lcdAvailable)
     {
@@ -1620,7 +1636,7 @@ void performFactoryReset()
     if (factoryPartition == NULL)
     {
         SerialMon.println("Factory partition not found");
-        publishMQTT("FACTORY_RESET:ERROR:No factory partition");
+        publishMQTT(mqtt_topic_send, "FACTORY_RESET:ERROR:No factory partition");
         return;
     }
 
@@ -1628,7 +1644,7 @@ void performFactoryReset()
     if (err != ESP_OK)
     {
         SerialMon.printf("Failed to set factory partition: %s\n", esp_err_to_name(err));
-        publishMQTT("FACTORY_RESET:ERROR:Set failed");
+        publishMQTT(mqtt_topic_send, "FACTORY_RESET:ERROR:Set failed");
         return;
     }
 
@@ -1641,7 +1657,7 @@ void performFactoryReset()
     mqtt_pass = DEFAULT_PASSWORD;
 
     SerialMon.println("Factory reset complete");
-    publishMQTT("FACTORY_RESET:SUCCESS");
+    publishMQTT(mqtt_topic_send, "FACTORY_RESET:SUCCESS");
 #ifdef ENABLE_LCD
     if (lcdAvailable)
     {
@@ -1651,4 +1667,233 @@ void performFactoryReset()
 #endif
     delay(1000);
     ESP.restart();
+}
+
+// Check running partition
+void check_firmware_partition()
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY)
+    {
+        SerialMon.println("Running from factory partition");
+#ifdef ENABLE_LCD
+        if (lcdAvailable)
+        {
+            lcd.clear();
+            lcd.print("Factory Mode");
+        }
+#endif
+    }
+    else if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ||
+             running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
+    {
+        SerialMon.printf("Running from OTA partition %d\n", running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0);
+#ifdef ENABLE_LCD
+        if (lcdAvailable)
+        {
+            lcd.clear();
+            lcd.print("OTA Mode");
+        }
+#endif
+    }
+}
+
+void resetCredentials()
+{
+    preferences.begin("device-creds", false); // Open in read-write mode
+    preferences.clear();                      // Clear all key-value pairs in "device-creds"
+    preferences.end();
+
+    // Reset global variables to defaults
+    isProvisioned = false;
+    clientID = DEFAULT_CLIENT_ID;
+    mqtt_user = DEFAULT_USERNAME;
+    mqtt_pass = DEFAULT_PASSWORD;
+
+    SerialMon.println("Credentials reset to defaults");
+#ifdef ENABLE_LCD
+    if (lcdAvailable)
+    {
+        lcd.clear();
+        lcd.print("Creds Reset");
+    }
+#endif
+}
+
+// Load credentials from NVS
+void loadCredentials()
+{
+    preferences.begin("device-creds", true);
+    isProvisioned = preferences.getBool("provisioned", false);
+
+    if (isProvisioned)
+    {
+        clientID = preferences.getString("client_id", "GESUS_" + String(millis()));
+        mqtt_user = preferences.getString("username", "ESP32_" + imei);
+        mqtt_pass = preferences.getString("password", "");
+        if (mqtt_pass == "")
+        {
+            SerialMon.println("Warning: No saved password found, resetting to default");
+            isProvisioned = false;
+            clientID = DEFAULT_CLIENT_ID;
+            mqtt_user = DEFAULT_USERNAME;
+            mqtt_pass = DEFAULT_PASSWORD;
+        }
+    }
+    else
+    {
+        // clientID = "GESUS_" + String(millis());
+        // mqtt_user = "ESP32_" + imei;
+        // mqtt_pass = DEFAULT_PASSWORD;
+        clientID = DEFAULT_CLIENT_ID;
+        mqtt_user = DEFAULT_USERNAME;
+        mqtt_pass = DEFAULT_PASSWORD;
+    }
+
+    mqtt_user.replace("\r", "");
+    mqtt_user.replace("\n", "");
+    int okIndex = mqtt_user.indexOf("OK");
+    if (okIndex != -1)
+    {
+        mqtt_user = mqtt_user.substring(0, okIndex);
+    }
+    mqtt_user.trim();
+    mqtt_pass.replace("\r", "");
+    mqtt_pass.replace("\n", "");
+    mqtt_pass.trim();
+
+    preferences.end();
+    SerialMon.println("Loaded credentials:");
+    SerialMon.println("Client ID: " + clientID);
+    SerialMon.println("Username: " + mqtt_user);
+    SerialMon.println("Provisioned: " + String(isProvisioned ? "Yes" : "No"));
+}
+
+// Save credentials to NVS
+void saveCredentials(String newPassword)
+{
+    if (imei == "" || imei == "Unknown")
+    {
+        SerialMon.println("Cannot save credentials without valid IMEI");
+        return;
+    }
+
+    mqtt_user = "ESP32_" + imei;
+    mqtt_user.replace("\r", "");
+    mqtt_user.replace("\n", "");
+    int okIndex = mqtt_user.indexOf("OK");
+    if (okIndex != -1)
+    {
+        mqtt_user = mqtt_user.substring(0, okIndex);
+    }
+    mqtt_user.trim();
+
+    if (!isProvisioned)
+    {
+        clientID = "GESUS_" + String(millis());
+    }
+    mqtt_pass = newPassword;
+    mqtt_pass.replace("\r", "");
+    mqtt_pass.replace("\n", "");
+    mqtt_pass.trim();
+
+    preferences.begin("device-creds", false);
+    preferences.putString("client_id", clientID);
+    preferences.putString("username", mqtt_user);
+    preferences.putString("password", mqtt_pass);
+    preferences.putBool("provisioned", true);
+    preferences.end();
+
+    isProvisioned = true;
+    SerialMon.println("Saved new credentials:");
+    SerialMon.println("Client ID: " + clientID);
+    SerialMon.println("Username: " + mqtt_user);
+    SerialMon.println("Password length: " + String(mqtt_pass.length()));
+}
+
+bool republishProvisionRequest()
+{
+    if (!mqttServiceStarted || !provisionTopicSubscribed)
+    {
+        SerialMon.println("Cannot republish: MQTT not fully set up");
+        return false;
+    }
+
+    String requestMsg = "IMEI:" + imei;
+    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
+    {
+        SerialMon.println("Republished credentials request with IMEI: " + imei);
+        lastRequestTime = millis();
+        return true;
+    }
+    else
+    {
+        SerialMon.println("Failed to republish provisioning request");
+        return false;
+    }
+}
+
+// Request credentials from server
+bool requestCredentialsFromServer()
+{
+    if (imei == "" || imei == "Unknown")
+    {
+        SerialMon.println("No IMEI available for provisioning");
+        return false;
+    }
+
+    mqtt_user = DEFAULT_USERNAME;
+    mqtt_pass = DEFAULT_PASSWORD;
+    SerialMon.println("Set provisioning credentials - User: " + mqtt_user + ", Pass: " + mqtt_pass);
+
+    if (!mqttServiceStarted)
+    {
+        if (!setupMQTT())
+        {
+            SerialMon.println("Failed to start MQTT service for provisioning");
+            return false;
+        }
+    }
+    if (!connectMQTT())
+    {
+        SerialMon.println("Failed to connect with default credentials");
+        return false;
+    }
+    if (!provisionTopicSubscribed)
+    {
+        if (subscribeMQTT(PROVISION_RESPONSE_TOPIC))
+        {
+            provisionTopicSubscribed = true;
+            SerialMon.println("Subscribed to " + String(PROVISION_RESPONSE_TOPIC));
+        }
+        else
+        {
+            SerialMon.println("Failed to subscribe to provisioning topic, retrying on next cycle");
+            return false;  // Don’t disconnect, let it retry naturally
+        }
+    }
+
+    String requestMsg = "IMEI:" + imei;
+    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
+    {
+        SerialMon.println("Initial credentials request sent with IMEI: " + imei);
+    }
+    else
+    {
+        SerialMon.println("Failed to send initial provisioning request");
+        disconnectMQTT();
+        return false;
+    }
+
+#ifdef ENABLE_LCD
+    if (lcdAvailable)
+    {
+        lcd.clear();
+        lcd.print("Requesting Creds");
+    }
+#endif
+    waitingForProvisionResponse = true;
+    provisionStartTime = millis();
+    lastRequestTime = millis();
+    return true;
 }
