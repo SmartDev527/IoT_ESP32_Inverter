@@ -10,8 +10,9 @@
 #include <LCD_I2C.h>
 #endif
 #include <esp_task_wdt.h>
+#include <driver/uart.h>
 #include "mbedtls/aes.h"
-#include "mbedtls/sha256.h" // Added for SHA256
+#include "mbedtls/sha256.h"
 #include "certificates.h"
 #include <esp_ota_ops.h>
 #include <map>
@@ -29,7 +30,7 @@
 #define LED_PIN 13
 #define FACTORY_RESET_PIN 4
 
-// Default credentials for initial provisioning
+// Default credentials
 #define DEFAULT_CLIENT_ID "ESP32_SIM7600_Client"
 #define DEFAULT_USERNAME "ESP32"
 #define DEFAULT_PASSWORD "12345"
@@ -49,6 +50,7 @@ const unsigned char aes_iv[16] = {
     0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
     0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46};
 
+
 // Serial interfaces
 HardwareSerial sim7600(1);
 #define SerialMon Serial
@@ -62,9 +64,8 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
-// State machine states
-enum SetupState
-{
+// State machine states (unchanged)
+enum SetupState {
     STATE_INIT_MODEM,
     STATE_WAIT_NETWORK,
     STATE_CONNECT_GPRS,
@@ -82,14 +83,35 @@ enum SetupState
     STATE_RECOVER_MQTT
 };
 
-// Configuration
+struct MqttStatus {
+    bool serviceStarted = false;    // AT+CMQTTSTART succeeded
+    bool clientAcquired = false;    // AT+CMQTTACCQ succeeded
+    bool connected = false;         // AT+CMQTTCONNECT succeeded
+    bool subscribed = false;        // AT+CMQTTSUB succeeded for main topics
+    bool provisionSubscribed = false; // AT+CMQTTSUB succeeded for provisioning topic
+    int lastErrorCode = 0;          // Last MQTT-related error code (e.g., 19)
+    unsigned long lastConnectTime = 0; // Timestamp of last successful connection
+
+    // Reset all flags and status
+    void reset() {
+        serviceStarted = false;
+        clientAcquired = false;
+        connected = false;
+        subscribed = false;
+        provisionSubscribed = false;
+        lastErrorCode = 0;
+        lastConnectTime = 0;
+    }
+};
+
+// Configuration (unchanged)
 const int MAX_RETRIES = 10;
 const int RETRY_DELAY = 2000;
 const size_t OTA_CHUNK_SIZE = 1028;
 const size_t OTA_MAX_DATA_SIZE = OTA_CHUNK_SIZE - 4;
-const int BATCH_SIZE = 10;              // Send 10 chunks per batch
-std::vector<unsigned long> batchChunks; // Buffer for current batch
-unsigned long expectedBatchEnd = 0;     // Last chunk number in current batch
+const int BATCH_SIZE = 10;
+std::vector<unsigned long> batchChunks;
+unsigned long expectedBatchEnd = 0;
 
 const char *cert_name = "iot_inverter2.pem";
 const char *mqtt_server = "u008dd8e.ala.dedicated.aws.emqxcloud.com";
@@ -103,7 +125,7 @@ const unsigned long MONITOR_INTERVAL = 5000;
 const uint32_t WDT_TIMEOUT = 30;
 const size_t CHUNK_SIZE = 1024;
 
-// Global variables
+// Global variables (unchanged except where noted)
 SetupState currentState = STATE_INIT_MODEM;
 int retryCount = 0;
 uint8_t ledStatus = 0;
@@ -117,8 +139,9 @@ void *lcd = nullptr;
 String clientID = DEFAULT_CLIENT_ID;
 String mqtt_user = DEFAULT_USERNAME;
 String mqtt_pass = DEFAULT_PASSWORD;
+MqttStatus mqttStatus;
+
 String imei = "";
-String incomingBuffer = "";
 unsigned long lastMonitorTime = 0;
 String pendingTopic = "";
 String pendingPayload = "";
@@ -130,16 +153,14 @@ unsigned char encryptedBuffer[128];
 bool isProvisioned = false;
 Preferences preferences;
 bool factoryResetTriggered = false;
-bool waitingForProvisionResponse = false;               // New flag to track provisioning wait
-unsigned long provisionTimeout = 1200000;               // Timeout for provisioning response
-unsigned long provisionStartTime = 0;                   // New variable to track request start time
-const unsigned long PROVISION_REQUEST_INTERVAL = 10000; // Retry request every 10 seconds
-unsigned long PROVISION_RESTART_TIMEOUT = 120000;       // Default restart timeout: 120 seconds (2 minutes)
+bool waitingForProvisionResponse = false;
+unsigned long provisionTimeout = 1200000;
+unsigned long provisionStartTime = 0;
+const unsigned long PROVISION_REQUEST_INTERVAL = 10000;
+unsigned long PROVISION_RESTART_TIMEOUT = 120000;
 unsigned long lastRequestTime = 0;
 static int publishRetryCount = 0;
-// Track subscription state for provisioning topic
-static bool provisionTopicSubscribed = false;
-// OTA variables
+
 bool otaInProgress = false;
 unsigned long otaReceivedSize = 0;
 unsigned long otaTotalSize = 0;
@@ -153,9 +174,12 @@ unsigned long bootTime = 0;
 unsigned long validationDelay = 60000;
 bool pendingValidation = false;
 unsigned int mqttErrors = 0;
-bool mqttServiceStarted = false;
-String otaHash = "";               // Expected SHA256 hash from server
-mbedtls_sha256_context sha256_ctx; // For computing received hash
+
+String otaHash = "";
+mbedtls_sha256_context sha256_ctx;
+
+
+
 
 // Base64 encoding/decoding tables
 static const char base64_enc_map[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -207,6 +231,8 @@ bool requestCredentialsFromServer();
 bool republishProvisionRequest();
 void performFactoryReset();
 void resetCredentials();
+static void uart_event_task(void *pvParameters); // New UART interrupt task
+
 
 // Base64 encode function
 String base64_encode(const unsigned char *input, size_t len)
@@ -292,14 +318,14 @@ size_t pkcs7_unpad(unsigned char *data, size_t data_len)
     return data_len - pad_value;
 }
 
-void setup()
-{
+// Setup function with UART interrupt initialization
+void setup() {
     esp_task_wdt_reset();
     SerialMon.begin(115200);
     delay(1000);
     SerialMon.println("Starting...");
 
-    mqttServiceStarted = false;
+    mqttStatus.reset();
     otaInProgress = false;
     otaReceivedSize = 0;
     otaTotalSize = 0;
@@ -307,7 +333,7 @@ void setup()
     receivedChunks.clear();
     missingChunks.clear();
 
-    sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); // Sole UART access via TinyGsm
     esp_task_wdt_init(WDT_TIMEOUT * 1000, true);
     esp_task_wdt_add(NULL);
 
@@ -334,28 +360,22 @@ void setup()
     resetCredentials();
     bootTime = millis();
 
-    if (tryStep("Initializing modem", modem.init()))
-    {
+    if (tryStep("Initializing modem", modem.init())) {
         SerialMon.println("Modem initialized: " + modem.getModemInfo());
         modem.sendAT("+CGSN");
         String rawImei;
-        if (modem.waitResponse(1000L, rawImei) != 1)
-        {
+        if (modem.waitResponse(1000L, rawImei) != 1) {
             SerialMon.println("Failed to retrieve IMEI");
             imei = "Unknown";
-        }
-        else
-        {
+        } else {
             imei = rawImei;
             imei.replace("\r", "");
             imei.replace("\n", "");
             int okIndex = imei.indexOf("OK");
-            if (okIndex != -1)
-            {
-                imei = imei.substring(0, okIndex); // Strip "OK" and beyond
+            if (okIndex != -1) {
+                imei = imei.substring(0, okIndex);
             }
             imei.trim();
-
             SerialMon.print("Cleaned IMEI: ");
             SerialMon.println(imei);
         }
@@ -365,231 +385,115 @@ void setup()
     }
 }
 
-void loop()
-{
+void loop() {
     esp_task_wdt_reset();
-    if (digitalRead(FACTORY_RESET_PIN) == LOW)
-    {
+    if (digitalRead(FACTORY_RESET_PIN) == LOW) {
         delay(50);
-        if (digitalRead(FACTORY_RESET_PIN) == LOW)
-        {
+        if (digitalRead(FACTORY_RESET_PIN) == LOW) {
             factoryResetTriggered = true;
             performFactoryReset();
         }
     }
 
-    while (SerialAT.available())
-    {
-        char c = SerialAT.read();
-        incomingBuffer += c;
-        if (c == '\n')
-        {
-            processURC(incomingBuffer);
-            incomingBuffer = "";
-        }
+    // Poll for URCs
+    while (SerialAT.available()) {
+        String urc = SerialAT.readStringUntil('\n');
+        processURC(urc);
     }
 
-    switch (currentState)
-    {
-    case STATE_INIT_MODEM:
-        if (tryStep("Initializing modem", modem.init()))
-        {
-            SerialMon.println("Modem initialized: " + modem.getModemInfo());
-            modem.sendAT("+CGSN");
-            if (modem.waitResponse(1000L, imei) != 1)
-            {
-                SerialMon.println("Failed to retrieve IMEI");
-                imei = "Unknown";
-            }
-            else
-            {
-                imei.trim();
-                // SerialMon.println("Retrieved IMEI: " + imei);
-            }
-            nextState(STATE_WAIT_NETWORK);
-        }
-        break;
-
-    case STATE_WAIT_NETWORK:
-        if (tryStep("Waiting for network", modem.waitForNetwork()))
-        {
-            nextState(STATE_CONNECT_GPRS);
-        }
-        break;
-
-    case STATE_CONNECT_GPRS:
-        if (tryStep("Connecting to " + String(apn), modem.gprsConnect(apn, gprsUser, gprsPass)))
-        {
-            nextState(STATE_UPLOAD_CERTIFICATE);
-        }
-        break;
-
-    case STATE_UPLOAD_CERTIFICATE:
-        if (tryStep("Uploading certificate", uploadCertificate()))
-        {
-            nextState(STATE_SETUP_SSL);
-        }
-        break;
-
-    case STATE_SETUP_SSL:
-        if (tryStep("Setting up SSL", setupSSL()))
-        {
-            nextState(STATE_SETUP_MQTT);
-        }
-        break;
-
-    case STATE_SETUP_MQTT:
-        if (tryStep("Setting up MQTT", setupMQTT()))
-        {
-            if (!isProvisioned)
-            {
-                if (requestCredentialsFromServer())
-                {
-                    nextState(STATE_WAIT_PROVISION);
+    switch (currentState) {
+        case STATE_INIT_MODEM:
+            if (tryStep("Initializing modem", modem.init())) {
+                modem.sendAT("+CGSN");
+                if (modem.waitResponse(1000L, imei) != 1) {
+                    imei = "Unknown";
+                } else {
+                    imei.trim();
                 }
-                else
-                {
-                    SerialMon.println("Failed to request provisioning credentials");
-                    nextState(STATE_ERROR);
-                }
+                nextState(STATE_WAIT_NETWORK);
             }
-            else
-            {
-                nextState(STATE_CONNECT_MQTT);
-            }
-        }
-        break;
-    case STATE_WAIT_PROVISION:
-    {
-        unsigned long currentTime = millis();
-
-        // Check for timeout
-        if (currentTime - provisionStartTime >= provisionTimeout)
-        {
-            SerialMon.println("Provisioning timeout exceeded");
-            waitingForProvisionResponse = false;
-            disconnectMQTT();
-            stopMQTT();
-            nextState(STATE_ERROR);
             break;
-        }
 
-        // Retry request if interval elapsed
-        if (currentTime - lastRequestTime >= PROVISION_REQUEST_INTERVAL)
-        {
-            if (republishProvisionRequest())
-            {
-                SerialMon.println("Retried provisioning request");
+        case STATE_WAIT_NETWORK:
+            if (tryStep("Waiting for network", modem.waitForNetwork())) {
+                nextState(STATE_CONNECT_GPRS);
             }
-            else
-            {
-                SerialMon.println("Failed to retry provisioning request");
-                publishRetryCount++;
-                if (publishRetryCount >= MAX_RETRIES)
-                {
-                    nextState(STATE_ERROR);
+            break;
+
+        case STATE_CONNECT_GPRS:
+            if (tryStep("Connecting to " + String(apn), modem.gprsConnect(apn, gprsUser, gprsPass))) {
+                nextState(STATE_UPLOAD_CERTIFICATE);
+            }
+            break;
+
+        case STATE_UPLOAD_CERTIFICATE:
+            if (tryStep("Uploading certificate", uploadCertificate())) {
+                nextState(STATE_SETUP_SSL);
+            }
+            break;
+
+        case STATE_SETUP_SSL:
+            if (tryStep("Setting up SSL", setupSSL())) {
+                nextState(STATE_SETUP_MQTT);
+            }
+            break;
+
+        case STATE_SETUP_MQTT:
+            if (tryStep("Setting up MQTT", setupMQTT())) {
+                if (!isProvisioned) {
+                    if (requestCredentialsFromServer()) {
+                        nextState(STATE_WAIT_PROVISION);
+                    } else {
+                        nextState(STATE_ERROR);
+                    }
+                } else {
+                    nextState(STATE_CONNECT_MQTT);
                 }
             }
-        }
+            break;
 
-        // Status update
-        SerialMon.println("Waiting for provisioning response...");
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("Waiting Provision");
-            lcd.setCursor(0, 1);
-            lcd.print((currentTime - provisionStartTime) / 1000);
-            lcd.print("s");
-        }
-#endif
-        rgbLed.setPixelColor(0, 255, 165, 0); // Orange while waiting
-        rgbLed.show();
-        delay(1000); // Reduce CPU usage while waiting
-        break;
-    }
-    case STATE_CONNECT_MQTT:
-        SerialMon.println("Before connect - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
-        if (tryStep("Connecting to MQTT", connectMQTT()))
-        {
-            nextState(STATE_SUBSCRIBE_MQTT);
-        }
-        break;
+        case STATE_WAIT_PROVISION:
+            if (millis() - provisionStartTime >= provisionTimeout) {
+                SerialMon.println("Provisioning timeout exceeded");
+                waitingForProvisionResponse = false;
+                stopMQTT();
+                nextState(STATE_ERROR);
+            } else if (millis() - lastRequestTime >= PROVISION_REQUEST_INTERVAL) {
+                republishProvisionRequest();
+            }
+            break;
 
-    case STATE_SUBSCRIBE_MQTT:
-        if (tryStep("Subscribing to MQTT", subscribeMQTT()))
-        {
-            nextState(STATE_RUNNING);
-        }
-        break;
+        case STATE_CONNECT_MQTT:
+            if (tryStep("Connecting to MQTT", connectMQTT())) {
+                nextState(STATE_SUBSCRIBE_MQTT);
+            }
+            break;
 
-    case STATE_RUNNING:
-        if (millis() - lastMonitorTime >= MONITOR_INTERVAL)
-        {
-            monitorConnections();
-            lastMonitorTime = millis();
-        }
-        break;
+        case STATE_SUBSCRIBE_MQTT:
+            if (tryStep("Subscribing to MQTT", subscribeMQTT())) {
+                nextState(STATE_RUNNING);
+            }
+            break;
 
-    case STATE_ERROR:
-        SerialMon.println("Setup failed, cleaning up...");
-        cleanupResources();
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("Error - Resetting");
-        }
-#endif
-        resetModem();
-        nextState(STATE_INIT_MODEM); // Retry from the beginning
-                                     // ESP.restart();
-        break;
+        case STATE_RUNNING:
+            if (millis() - lastMonitorTime >= MONITOR_INTERVAL) {
+                monitorConnections();
+                lastMonitorTime = millis();
+            }
+            break;
 
-    case STATE_STOPPED:
-        SerialMon.println("Device stopped by server command");
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("Device Stopped");
-        }
-#endif
-        while (true)
-            delay(1000);
-        break;
+        case STATE_ERROR:
+            SerialMon.println("Setup failed, cleaning up...");
+            cleanupResources();
+            resetModem();
+            nextState(STATE_INIT_MODEM);
+            break;
 
-    case STATE_RECOVER_NETWORK:
-        if (tryStep("Recovering network", modem.waitForNetwork()))
-        {
-            nextState(STATE_RECOVER_GPRS);
-        }
-        break;
-
-    case STATE_RECOVER_GPRS:
-        if (tryStep("Recovering GPRS", modem.gprsConnect(apn, gprsUser, gprsPass)))
-        {
-            nextState(STATE_RECOVER_MQTT);
-        }
-        break;
-
-    case STATE_RECOVER_MQTT:
-        if (tryStep("Recovering MQTT", connectMQTT() && subscribeMQTT()))
-        {
-            nextState(STATE_RUNNING);
-        }
-        break;
-    }
-
-    // Check provisioning timeout
-    if (waitingForProvisionResponse && millis() >= provisionTimeout)
-    {
-        SerialMon.println("Timeout waiting for provisioning response");
-        waitingForProvisionResponse = false;
-        disconnectMQTT();
-        stopMQTT();
-        nextState(STATE_ERROR);
+        case STATE_RECOVER_MQTT:
+            if (tryStep("Recovering MQTT", connectMQTT() && subscribeMQTT())) {
+                nextState(STATE_RUNNING);
+            }
+            break;
     }
 }
 
@@ -744,7 +648,7 @@ void handleMessage(String topic, String payload)
             }
 
             waitingForProvisionResponse = false;
-            provisionTopicSubscribed = false;  // Reset subscription flag
+            mqttStatus.provisionSubscribed = false;  // Reset subscription flag
             if (currentState == STATE_WAIT_PROVISION)
             {
                 nextState(STATE_CONNECT_MQTT);
@@ -825,7 +729,7 @@ void resetModem()
     delay(1500);
     digitalWrite(SIM7600_PWR, HIGH);
     delay(5000);
-    mqttServiceStarted = false; // Reset flag since modem is restarted
+    mqttStatus.serviceStarted = false; // Reset flag since modem is restarted
 }
 
 void resetState()
@@ -891,83 +795,65 @@ void cleanupResources()
         receivedChunks.clear();
         missingChunks.clear();
         SerialMon.println("OTA data cleared due to cleanup");
-    }
-    incomingBuffer = "";
+    }    
     pendingTopic = "";
     pendingPayload = "";
     publishRetryCount = 0;  // Reset on success
     waitingForProvisionResponse = false; // Reset provisioning flag
 }
 
-void processURC(String urc)
-{
+void processURC(String urc) {
     urc.trim();
-    if (urc.length() > 0)  // Avoid logging empty URCs
-    {
+    if (urc.length() > 0) {
         SerialMon.println("URC: " + urc);
     }
-    if (urc.startsWith("+CMQTTSUB: 0,0"))
-    {
+    if (urc.startsWith("+CMQTTCONNLOST: 0,")) {
+        SerialMon.println("MQTT connection lost detected");
+        mqttStatus.connected = false;
+        mqttStatus.subscribed = false;
+        if (currentState == STATE_RUNNING || currentState == STATE_WAIT_PROVISION) {
+            nextState(STATE_RECOVER_MQTT);
+        }
+    } else if (urc.startsWith("+CMQTTSUB: 0,0")) {
         SerialMon.println("Subscription confirmed via URC");
-        if (!provisionTopicSubscribed && waitingForProvisionResponse)
-        {
-            provisionTopicSubscribed = true;
-            SerialMon.println("Late subscription confirmation for " + String(PROVISION_RESPONSE_TOPIC));
+        if (!mqttStatus.provisionSubscribed && waitingForProvisionResponse) {
+            mqttStatus.provisionSubscribed = true;
         }
-    }
-    else if (urc.startsWith("+CMQTTRXSTART: 0,"))
-    {
-        // Handle incoming message as before
+    } else if (urc.startsWith("+CMQTTACCQ: 0,0")) {
+        SerialMon.println("MQTT client acquisition confirmed via URC");
+        mqttStatus.clientAcquired = true;
+    } else if (urc.startsWith("+CMQTTACCQ: 0,")) {
+        int errorCode = urc.substring(urc.indexOf(",") + 1).toInt();
+        SerialMon.println("MQTT client acquisition failed via URC - Error: " + String(errorCode));
+        mqttStatus.clientAcquired = false;
+        mqttStatus.lastErrorCode = errorCode;
+        if (errorCode == 19 && currentState == STATE_SETUP_MQTT) {
+            SerialMon.println("Error 19 detected in URC, forcing cleanup...");
+            stopMQTT();
+            nextState(STATE_SETUP_MQTT);
+        }
+    } else if (urc.startsWith("+CMQTTCONNECT: 0,0")) {
+        SerialMon.println("MQTT connection confirmed via URC");
+        mqttStatus.connected = true;
+        mqttStatus.lastConnectTime = millis();
+    } else if (urc.startsWith("+CMQTTCONNECT: 0,")) {
+        int errorCode = urc.substring(urc.indexOf(",") + 1).toInt();
+        SerialMon.println("MQTT connection failed via URC - Error: " + String(errorCode));
+        mqttStatus.connected = false;
+        mqttStatus.lastErrorCode = errorCode;
+    } else if (urc.startsWith("+CMQTTRXSTART: 0,")) {
         messageInProgress = true;
         pendingTopic = "";
         pendingPayload = "";
         int commaIdx = urc.indexOf(',', 14);
         pendingTopicLen = urc.substring(14, commaIdx).toInt();
         pendingPayloadLen = urc.substring(commaIdx + 1).toInt();
-        SerialMon.println("Message start - Topic Len: " + String(pendingTopicLen) + ", Payload Len: " + String(pendingPayloadLen));
-    }
-    else if (urc.startsWith("+CMQTTRXSTART: 0,"))
-    {
-        messageInProgress = true;
-        pendingTopic = "";
-        pendingPayload = "";
-        int commaIdx = urc.indexOf(',', 14);
-        pendingTopicLen = urc.substring(14, commaIdx).toInt();
-        pendingPayloadLen = urc.substring(commaIdx + 1).toInt();
-    }
-    else if (urc.startsWith("+CMQTTRXTOPIC: 0,"))
-    {
-        // Topic length already set, wait for topic content
-    }
-    else if (messageInProgress && !urc.startsWith("+") && pendingTopic == "")
-    {
+    } else if (messageInProgress && !urc.startsWith("+") && pendingTopic == "") {
         pendingTopic = urc;
-        if (waitingForProvisionResponse && pendingTopic == PROVISION_RESPONSE_TOPIC)
-        {
-            // Waiting for provisioning response, proceed to payload
-        }
-    }
-    else if (urc.startsWith("+CMQTTRXPAYLOAD: 0,"))
-    {
-        // Payload length already set, wait for payload content
-    }
-    else if (messageInProgress && !urc.startsWith("+") && pendingTopic != "" && pendingPayload == "")
-    {
+    } else if (messageInProgress && !urc.startsWith("+") && pendingTopic != "" && pendingPayload == "") {
         pendingPayload = urc;
-        if (waitingForProvisionResponse && pendingTopic == PROVISION_RESPONSE_TOPIC)
-        {
-            SerialMon.println("Received provisioning payload: " + pendingPayload);
-            handleMessage(pendingTopic, pendingPayload);
-            pendingTopic = "";
-            pendingPayload = "";
-            messageInProgress = false;
-        }
-    }
-    else if (urc == "+CMQTTRXEND: 0")
-    {
-        if (messageInProgress && pendingTopic != "" && pendingPayload != "")
-        {
-            SerialMon.println("Handling message - Topic: " + pendingTopic + ", Payload: " + pendingPayload);
+    } else if (urc == "+CMQTTRXEND: 0") {
+        if (messageInProgress && pendingTopic != "" && pendingPayload != "") {
             handleMessage(pendingTopic, pendingPayload);
         }
         messageInProgress = false;
@@ -975,16 +861,6 @@ void processURC(String urc)
         pendingPayload = "";
         pendingTopicLen = 0;
         pendingPayloadLen = 0;
-    }
-    else if (urc.startsWith("+CMQTTCONNLOST: 0,"))
-    {
-        SerialMon.println("MQTT connection lost detected");
-        if (currentState == STATE_WAIT_PROVISION || currentState == STATE_RUNNING)
-        {
-            disconnectMQTT();
-            stopMQTT();
-            nextState(STATE_RECOVER_MQTT);  // Attempt to recover the connection
-        }
     }
 }
 
@@ -1018,218 +894,277 @@ bool setupSSL()
     return modem.waitResponse() == 1;
 }
 
-bool setupMQTT()
-{
-    if (!mqttServiceStarted)
-    {
+bool setupMQTT() {
+    if (!mqttStatus.serviceStarted) {
         SerialAT.println("AT+CMQTTSTART");
-        String response = "";
-        int8_t res = modem.waitResponse(5000L, response);
-        response.trim();
-        SerialMon.println("MQTT start response: " + response);
-
-        if (response.indexOf("+CMQTTSTART: 0") >= 0)
-        {
-            mqttServiceStarted = true;
-            SerialMon.println("MQTT service started successfully");
-        }
-        else if (response.indexOf("+CMQTTSTART: 23") >= 0)
-        {
-            mqttServiceStarted = true;
-            SerialMon.println("MQTT service already running (+CMQTTSTART: 23), proceeding");
-        }
-        else
-        {
-            if (response.length() > 0)
-            {
-                SerialMon.println("MQTT start failed with response: " + response);
-            }
-            else
-            {
-                SerialMon.println("No response to AT+CMQTTSTART within timeout");
+        String response;
+        if (modem.waitResponse(10000L, response) != 1) {
+            response.trim();
+            SerialMon.println("MQTT start failed - Response: " + response);
+            if (response.indexOf("+CMQTTSTART:") >= 0) {
+                mqttStatus.lastErrorCode = response.substring(response.indexOf(":") + 2).toInt();
             }
             return false;
         }
-    }
-    else
-    {
+        response.trim();
+        if (response.indexOf("+CMQTTSTART: 0") >= 0) {
+            mqttStatus.serviceStarted = true;
+            SerialMon.println("MQTT service started successfully");
+        } else if (response.indexOf("+CMQTTSTART: 23") >= 0) {
+            mqttStatus.serviceStarted = true;
+            SerialMon.println("MQTT service already running (+CMQTTSTART: 23), proceeding");
+        } else {
+            SerialMon.println("MQTT start failed - Response: " + response);
+            if (response.indexOf("+CMQTTSTART:") >= 0) {
+                mqttStatus.lastErrorCode = response.substring(response.indexOf(":") + 2).toInt();
+            }
+            return false;
+        }
+    } else {
         SerialMon.println("MQTT service already started, skipping AT+CMQTTSTART");
     }
 
-    // Generate trimmed dynamic clientID
-    unsigned long timeVal = millis() & 0xFFF;  // 0-4095, max 4 digits
-    clientID = "ESP32_" + String(timeVal);
-    SerialMon.println("Generated clientID: " + clientID);
+    if (!mqttStatus.clientAcquired) {
+        unsigned long timeVal = millis() & 0xFFF;
+        clientID = "ESP32_" + String(timeVal);
+        SerialMon.println("Generated clientID: " + clientID);
 
-    // Acquire MQTT client
-    char accqCmd[64];
-    snprintf(accqCmd, sizeof(accqCmd), "AT+CMQTTACCQ=0,\"%s\",1", clientID.c_str());
-    SerialMon.println("Sending: " + String(accqCmd));
-    SerialAT.println(accqCmd);
-    String accqResponse;
-    if (modem.waitResponse(2000L, accqResponse) != 1)
-    {
-        accqResponse.trim();
-        SerialMon.println("Failed to acquire MQTT client - Response: " + accqResponse);
-        return false;
+        char accqCmd[64];
+        snprintf(accqCmd, sizeof(accqCmd), "AT+CMQTTACCQ=0,\"%s\",1", clientID.c_str());
+        SerialMon.println("Sending: " + String(accqCmd));
+        SerialAT.println(accqCmd);
+
+        String accqResponse;
+        if (modem.waitResponse(10000L, accqResponse, "OK", "+CMQTTACCQ: 0,")) {
+            accqResponse.trim();
+            SerialMon.println("Response to AT+CMQTTACCQ: " + accqResponse);
+
+            if (accqResponse.indexOf("+CMQTTACCQ: 0,0") >= 0) {
+                mqttStatus.clientAcquired = true;
+                SerialMon.println("MQTT client acquired successfully");
+            } else if (accqResponse.indexOf("+CMQTTACCQ: 0,") >= 0) {
+                String errorPart = accqResponse.substring(accqResponse.indexOf(",") + 1);
+                if (errorPart.length() > 0 && errorPart.toInt() != 0) { // Check if there's a non-zero error code
+                    mqttStatus.lastErrorCode = errorPart.toInt();
+                    SerialMon.println("Failed to acquire MQTT client - Error: " + String(mqttStatus.lastErrorCode));
+                    if (mqttStatus.lastErrorCode == 19) {
+                        SerialMon.println("Error 19: Client index in use, forcing cleanup...");
+                        stopMQTT();
+                        return setupMQTT();
+                    }
+                    return false;
+                } else {
+                    SerialMon.println("Incomplete URC (+CMQTTACCQ: 0,), checking client status...");
+                    // Fallback: Check client status manually
+                    SerialAT.println("AT+CMQTTCLIENT?");
+                    String clientResponse;
+                    if (modem.waitResponse(5000L, clientResponse) == 1 && clientResponse.indexOf(clientID) >= 0) {
+                        mqttStatus.clientAcquired = true;
+                        SerialMon.println("MQTT client confirmed active via AT+CMQTTCLIENT?");
+                    } else {
+                        SerialMon.println("Client not confirmed - Response: " + clientResponse);
+                        return false;
+                    }
+                }
+            } else if (accqResponse == "OK") {
+                SerialMon.println("AT+CMQTTACCQ OK received, awaiting URC...");
+                String urcResponse;
+                if (modem.waitResponse(15000L, urcResponse, "+CMQTTACCQ: 0,0", "+CMQTTACCQ: 0,")) {
+                    urcResponse.trim();
+                    if (urcResponse.indexOf("+CMQTTACCQ: 0,0") >= 0) {
+                        mqttStatus.clientAcquired = true;
+                        SerialMon.println("MQTT client acquisition confirmed via URC");
+                    } else if (urcResponse.indexOf("+CMQTTACCQ: 0,") >= 0) {
+                        String errorPart = urcResponse.substring(urcResponse.indexOf(",") + 1);
+                        if (errorPart.length() > 0 && errorPart.toInt() != 0) {
+                            mqttStatus.lastErrorCode = errorPart.toInt();
+                            SerialMon.println("Failed to acquire MQTT client - URC Error: " + String(mqttStatus.lastErrorCode));
+                            if (mqttStatus.lastErrorCode == 19) {
+                                SerialMon.println("Error 19: Client index in use, forcing cleanup...");
+                                stopMQTT();
+                                return setupMQTT();
+                            }
+                            return false;
+                        } else {
+                            SerialMon.println("Incomplete URC (+CMQTTACCQ: 0,) after OK, checking client status...");
+                            SerialAT.println("AT+CMQTTCLIENT?");
+                            String clientResponse;
+                            if (modem.waitResponse(5000L, clientResponse) == 1 && clientResponse.indexOf(clientID) >= 0) {
+                                mqttStatus.clientAcquired = true;
+                                SerialMon.println("MQTT client confirmed active via AT+CMQTTCLIENT?");
+                            } else {
+                                SerialMon.println("Client not confirmed - Response: " + clientResponse);
+                                return false;
+                            }
+                        }
+                    } else {
+                        SerialMon.println("No valid URC after OK - Response: " + urcResponse);
+                        SerialMon.println("Checking client status as fallback...");
+                        SerialAT.println("AT+CMQTTCLIENT?");
+                        String clientResponse;
+                        if (modem.waitResponse(5000L, clientResponse) == 1 && clientResponse.indexOf(clientID) >= 0) {
+                            mqttStatus.clientAcquired = true;
+                            SerialMon.println("MQTT client confirmed active via AT+CMQTTCLIENT?");
+                        } else {
+                            SerialMon.println("Client not confirmed - Response: " + clientResponse);
+                            return false;
+                        }
+                    }
+                } else {
+                    SerialMon.println("Timeout waiting for URC after OK, checking client status...");
+                    SerialAT.println("AT+CMQTTCLIENT?");
+                    String clientResponse;
+                    if (modem.waitResponse(5000L, clientResponse) == 1 && clientResponse.indexOf(clientID) >= 0) {
+                        mqttStatus.clientAcquired = true;
+                        SerialMon.println("MQTT client confirmed active via AT+CMQTTCLIENT?");
+                    } else {
+                        SerialMon.println("Client not confirmed - Response: " + clientResponse);
+                        return false;
+                    }
+                }
+            } else {
+                SerialMon.println("Unexpected response: " + accqResponse);
+                return false;
+            }
+        } else {
+            SerialMon.println("No response to AT+CMQTTACCQ within timeout");
+            return false;
+        }
+    } else {
+        SerialMon.println("MQTT client already acquired, skipping AT+CMQTTACCQ");
     }
-    SerialMon.println("MQTT client acquired successfully");
 
-    // Configure SSL
-    SerialAT.println("AT+CMQTTSSLCFG=0,0");
-    if (modem.waitResponse(2000L) != 1)
-    {
-        SerialMon.println("Failed to configure SSL for MQTT");
-        return false;
-    }
-
-    SerialMon.println("Setting up MQTT... success");
-    SerialMon.println("Credentials after setup - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
-    return true;
-}
-
-bool connectMQTT()
-{
-    if (!mqttServiceStarted)
-    {
-        SerialMon.println("MQTT service not started, attempting setup...");
-        if (!setupMQTT())
-        {
-            SerialMon.println("Failed to start MQTT service before connecting");
+    if (!mqttStatus.connected) {
+        SerialAT.println("AT+CMQTTSSLCFG=0,0");
+        if (modem.waitResponse(2000L) != 1) {
+            SerialMon.println("Failed to configure SSL for MQTT");
             return false;
         }
     }
 
-    SerialMon.println("Before connect - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
+    SerialMon.println("Setting up MQTT... success");
+    return true;
+}
 
-    // Failsafe cleaning
-    String cleanUser = mqtt_user;
-    cleanUser.replace("\r", "");
-    cleanUser.replace("\n", "");
-    int okIndex = cleanUser.indexOf("OK");
-    if (okIndex != -1)
-    {
-        cleanUser = cleanUser.substring(0, okIndex);
+bool connectMQTT() {
+    if (mqttStatus.connected) {
+        SerialMon.println("MQTT already connected, skipping connect");
+        return true;
     }
-    cleanUser.trim();
-    String cleanPass = mqtt_pass;
-    cleanPass.replace("\r", "");
-    cleanPass.replace("\n", "");
-    cleanPass.trim();
 
-    SerialAT.println("AT+CMQTTDISC=0,120");
-    modem.waitResponse(2000L);
+    if (!mqttStatus.serviceStarted || !mqttStatus.clientAcquired) {
+        SerialMon.println("MQTT service or client not ready, setting up...");
+        if (!setupMQTT()) {
+            return false;
+        }
+    }
 
-    char cmd[256] = {0};
-    int len = snprintf(cmd, sizeof(cmd),
-                       "AT+CMQTTCONNECT=0,\"tcp://%s:%d\",60,1,\"%s\",\"%s\"",
-                       mqtt_server, mqtt_port, cleanUser.c_str(), cleanPass.c_str());
+    SerialMon.println("Connecting - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
 
-    if (len < 0 || len >= sizeof(cmd))
-    {
-        SerialMon.println("Error: Command buffer overflow");
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=0,\"tcp://%s:%d\",60,1,\"%s\",\"%s\"",
+             mqtt_server, mqtt_port, mqtt_user.c_str(), mqtt_pass.c_str());
+    SerialAT.println(cmd);
+
+    String response;
+    // Wait for OK and collect URCs
+    if (modem.waitResponse(30000L, response, "OK", "+CMQTTCONNECT: 0,")) {
+        response.trim();
+        SerialMon.println("Response to AT+CMQTTCONNECT: " + response);
+        if (response.indexOf("+CMQTTCONNECT: 0,0") >= 0) {
+            mqttStatus.connected = true;
+            mqttStatus.lastConnectTime = millis();
+            SerialMon.println("MQTT connected successfully");
+        } else if (response.indexOf("+CMQTTCONNECT: 0,") >= 0) {
+            mqttStatus.lastErrorCode = response.substring(response.indexOf(",") + 1).toInt();
+            SerialMon.println("MQTT connection failed - Error: " + String(mqttStatus.lastErrorCode));
+            return false;
+        } else if (response == "OK") {
+            SerialMon.println("AT+CMQTTCONNECT OK received, awaiting URC...");
+            String urcResponse;
+            if (modem.waitResponse(15000L, urcResponse, "+CMQTTCONNECT: 0,0", "+CMQTTCONNECT: 0,")) {
+                urcResponse.trim();
+                if (urcResponse.indexOf("+CMQTTCONNECT: 0,0") >= 0) {
+                    mqttStatus.connected = true;
+                    mqttStatus.lastConnectTime = millis();
+                    SerialMon.println("MQTT connection confirmed via URC");
+                } else if (urcResponse.indexOf("+CMQTTCONNECT: 0,") >= 0) {
+                    mqttStatus.lastErrorCode = urcResponse.substring(urcResponse.indexOf(",") + 1).toInt();
+                    SerialMon.println("MQTT connection failed - URC Error: " + String(mqttStatus.lastErrorCode));
+                    return false;
+                } else {
+                    SerialMon.println("No valid URC after OK - Response: " + urcResponse);
+                    return false;
+                }
+            } else {
+                SerialMon.println("Timeout waiting for URC after OK");
+                return false;
+            }
+        } else {
+            SerialMon.println("Unexpected response: " + response);
+            return false;
+        }
+    } else {
+        SerialMon.println("No response to AT+CMQTTCONNECT within timeout");
         return false;
     }
 
-    SerialMon.println(cmd);
-    SerialAT.println(cmd);
-
-    String fullResponse;
-    unsigned long startTime = millis();
-    bool gotResponse = false;
-    while (millis() - startTime < 15000)
-    {
-        if (SerialAT.available())
-        {
-            String response = SerialAT.readStringUntil('\n');
-            response.trim();
-            if (response.length() > 0)
-            {
-                gotResponse = true;
-                fullResponse += response + "\n";
-                SerialMon.println("Received: " + response);
-                if (response == "+CMQTTCONNECT: 0,0")
-                {
-                    SerialMon.println("MQTT connected successfully");
-                    SerialMon.println("Full response: " + fullResponse);
-                    return true;
-                }
-                if (response.startsWith("+CMQTTCONNECT: 0,") && response != "+CMQTTCONNECT: 0,0")
-                {
-                    SerialMon.println("MQTT connection failed with error in response: " + response);
-                    SerialAT.println("AT+CMQTTREL=0");
-                    modem.waitResponse(2000L);
-                    return false;
-                }
-            }
-        }
-        delay(10);
-    }
-
-    if (!gotResponse)
-    {
-        SerialMon.println("No response from modem");
-    }
-    else
-    {
-        SerialMon.println("MQTT connection failed with final response: " + fullResponse);
-    }
-    SerialAT.println("AT+CMQTTREL=0");
-    modem.waitResponse(2000L);
-    return false;
+    return true;
 }
 
-bool subscribeMQTT(const char *topic)
-{
-    if (!topic || strlen(topic) == 0)
-    {
+bool subscribeMQTT(const char *topic) {
+    if (!topic || strlen(topic) == 0) {
         SerialMon.println("Invalid topic for subscription");
         return false;
     }
 
     modem.sendAT("+CMQTTSUBTOPIC=0,", String(strlen(topic)).c_str(), ",1");
-    if (modem.waitResponse(500L, ">") != 1)
-    {
+    if (modem.waitResponse(500L, ">") != 1) {
         SerialMon.println("Failed to set subscription topic: " + String(topic));
         return false;
     }
     SerialAT.print(topic);
-    if (modem.waitResponse(500L) != 1)
-    {
+    if (modem.waitResponse(500L) != 1) {
         SerialMon.println("Topic write failed for: " + String(topic));
         return false;
     }
 
     modem.sendAT("+CMQTTSUB=0");
     String response;
-    // Increase timeout to 5000ms to allow URC to arrive
-    int8_t res = modem.waitResponse(5000L, response);
-    response.trim();
-    SerialMon.println("Subscription response: " + response);
-
-    if (res == 1 && (response.indexOf("OK") >= 0 || response.indexOf("+CMQTTSUB: 0,0") >= 0))
-    {
-        SerialMon.println("Subscribed to: " + String(topic) + " (awaiting URC confirmation if not immediate)");
-        return true;  // Accept OK and handle URC later if delayed
-    }
-    else
-    {
+    if (modem.waitResponse(5000L, response) != 1 || response.indexOf("+CMQTTSUB: 0,0") < 0) {
+        response.trim();
         SerialMon.println("Failed to subscribe to: " + String(topic) + " - Response: " + response);
+        if (response.indexOf("+CMQTTSUB: 0,") >= 0) {
+            mqttStatus.lastErrorCode = response.substring(response.indexOf(",") + 1).toInt();
+        }
         return false;
     }
+    if (strcmp(topic, PROVISION_RESPONSE_TOPIC) == 0) {
+        mqttStatus.provisionSubscribed = true;
+    }
+    SerialMon.println("Subscribed to: " + String(topic));
+    return true;
 }
 
-bool subscribeMQTT()
-{
+bool subscribeMQTT() {
+    if (mqttStatus.subscribed) {
+        SerialMon.println("Already subscribed to MQTT topics, skipping");
+        return true;
+    }
+
     bool success = true;
     success &= subscribeMQTT(mqtt_topic_recv);
     success &= subscribeMQTT(mqtt_topic_firmware);
+    if (success) {
+        mqttStatus.subscribed = true;
+        SerialMon.println("MQTT subscriptions completed");
+    }
     return success;
 }
 
 bool publishMQTT(const char *topic, const char *message)
 {
-    if (!mqttServiceStarted || !connectMQTT())
+    if (!mqttStatus.serviceStarted || !connectMQTT())
     {
         SerialMon.println("Cannot publish: MQTT service not started or not connected");
         return false;
@@ -1294,7 +1229,7 @@ bool publishMQTT(const char *topic, const char *message)
 
 bool disconnectMQTT()
 {
-    if (!mqttServiceStarted)
+    if (!mqttStatus.serviceStarted)
     {
         SerialMon.println("MQTT service not started, no need to disconnect");
         return true; // Not an error if already disconnected
@@ -1307,22 +1242,70 @@ bool disconnectMQTT()
     return success;
 }
 
-bool stopMQTT()
-{
-   if (!mqttServiceStarted)
-    {
+bool stopMQTT() {
+    if (!mqttStatus.serviceStarted) {
         SerialMon.println("MQTT service already stopped");
         return true;
     }
-    modem.sendAT("+CMQTTSTOP");
-    if (modem.waitResponse(10000L, "+CMQTTSTOP: 0") != 1)
-    {
-        SerialMon.println("MQTT stop returned error, continuing cleanup");
+
+    if (mqttStatus.connected) {
+        SerialAT.println("AT+CMQTTDISC=0,120");
+        String discResponse;
+        if (modem.waitResponse(15000L, discResponse, "OK", "+CMQTTDISC: 0,")) {
+            discResponse.trim();
+            if (discResponse.indexOf("+CMQTTDISC: 0,0") >= 0) {
+                SerialMon.println("MQTT disconnected successfully");
+            } else if (discResponse.indexOf("+CMQTTDISC: 0,") >= 0) {
+                SerialMon.println("Warning: Disconnect failed - Error: " + discResponse.substring(discResponse.indexOf(",") + 1));
+            }
+        } else {
+            SerialMon.println("Warning: No response to AT+CMQTTDISC within timeout");
+        }
+        mqttStatus.connected = false;
+        delay(1000); // Allow modem to process
+    }
+
+    if (mqttStatus.clientAcquired) {
+        SerialAT.println("AT+CMQTTREL=0");
+        String relResponse;
+        if (modem.waitResponse(5000L, relResponse, "OK", "+CMQTTREL: 0,")) {
+            relResponse.trim();
+            if (relResponse.indexOf("OK") >= 0) {
+                SerialMon.println("MQTT client released successfully");
+            } else if (relResponse.indexOf("+CMQTTREL: 0,") >= 0) {
+                mqttStatus.lastErrorCode = relResponse.substring(relResponse.indexOf(",") + 1).toInt();
+                SerialMon.println("Warning: Failed to release MQTT client - Error: " + String(mqttStatus.lastErrorCode));
+            }
+        } else {
+            SerialMon.println("Warning: No response to AT+CMQTTREL within timeout");
+        }
+        mqttStatus.clientAcquired = false;
+        delay(1000); // Allow modem to process
+    }
+
+    SerialAT.println("AT+CMQTTSTOP");
+    String stopResponse;
+    if (modem.waitResponse(15000L, stopResponse, "OK", "+CMQTTSTOP:")) {
+        stopResponse.trim();
+        if (stopResponse.indexOf("+CMQTTSTOP: 0") >= 0) {
+            SerialMon.println("MQTT service stopped successfully");
+        } else if (stopResponse.indexOf("+CMQTTSTOP:") >= 0) {
+            mqttStatus.lastErrorCode = stopResponse.substring(stopResponse.indexOf(":") + 2).toInt();
+            SerialMon.println("MQTT stop failed - Error: " + String(mqttStatus.lastErrorCode));
+            SerialMon.println("Forcing modem reset due to stop failure...");
+            resetModem();
+            mqttStatus.reset();
+            return false;
+        }
+    } else {
+        SerialMon.println("No response to AT+CMQTTSTOP within timeout, forcing modem reset...");
+        resetModem();
+        mqttStatus.reset();
         return false;
     }
-    mqttServiceStarted = false;
-    provisionTopicSubscribed = false;
-    SerialMon.println("MQTT service stopped");
+
+    mqttStatus.reset();
+    SerialMon.println("MQTT service stopped successfully");
     return true;
 }
 
@@ -1813,7 +1796,7 @@ void saveCredentials(String newPassword)
 
 bool republishProvisionRequest()
 {
-    if (!mqttServiceStarted || !provisionTopicSubscribed)
+    if (!mqttStatus.serviceStarted || !mqttStatus.provisionSubscribed)
     {
         SerialMon.println("Cannot republish: MQTT not fully set up");
         return false;
@@ -1834,66 +1817,42 @@ bool republishProvisionRequest()
 }
 
 // Request credentials from server
-bool requestCredentialsFromServer()
-{
-    if (imei == "" || imei == "Unknown")
-    {
+bool requestCredentialsFromServer() {
+    if (imei == "" || imei == "Unknown") {
         SerialMon.println("No IMEI available for provisioning");
         return false;
     }
 
     mqtt_user = DEFAULT_USERNAME;
     mqtt_pass = DEFAULT_PASSWORD;
-    SerialMon.println("Set provisioning credentials - User: " + mqtt_user + ", Pass: " + mqtt_pass);
 
-    if (!mqttServiceStarted)
-    {
-        if (!setupMQTT())
-        {
-            SerialMon.println("Failed to start MQTT service for provisioning");
+    if (!mqttStatus.serviceStarted || !mqttStatus.clientAcquired) {
+        if (!setupMQTT()) {
             return false;
         }
     }
-    if (!connectMQTT())
-    {
-        SerialMon.println("Failed to connect with default credentials");
-        return false;
-    }
-    if (!provisionTopicSubscribed)
-    {
-        if (subscribeMQTT(PROVISION_RESPONSE_TOPIC))
-        {
-            provisionTopicSubscribed = true;
-            SerialMon.println("Subscribed to " + String(PROVISION_RESPONSE_TOPIC));
+    if (!mqttStatus.connected) {
+        if (!connectMQTT()) {
+            return false;
         }
-        else
-        {
-            SerialMon.println("Failed to subscribe to provisioning topic, retrying on next cycle");
-            return false;  // Don’t disconnect, let it retry naturally
+    }
+    if (!mqttStatus.provisionSubscribed) {
+        if (subscribeMQTT(PROVISION_RESPONSE_TOPIC)) {
+            mqttStatus.provisionSubscribed = true;
+        } else {
+            return false;
         }
     }
 
     String requestMsg = "IMEI:" + imei;
-    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
-    {
-        SerialMon.println("Initial credentials request sent with IMEI: " + imei);
+    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str())) {
+        SerialMon.println("Credentials request sent with IMEI: " + imei);
+        waitingForProvisionResponse = true;
+        provisionStartTime = millis();
+        lastRequestTime = millis();
+        return true;
     }
-    else
-    {
-        SerialMon.println("Failed to send initial provisioning request");
-        disconnectMQTT();
-        return false;
-    }
-
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Requesting Creds");
-    }
-#endif
-    waitingForProvisionResponse = true;
-    provisionStartTime = millis();
-    lastRequestTime = millis();
-    return true;
+    return false;
 }
+
+
