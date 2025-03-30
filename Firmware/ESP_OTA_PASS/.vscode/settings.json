@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+        "*.tpp": "cpp",
+        "new": "cpp",
+        "vector": "cpp",
+        "*.tcc": "cpp",
+        "deque": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "system_error": "cpp"
+    }
+}
