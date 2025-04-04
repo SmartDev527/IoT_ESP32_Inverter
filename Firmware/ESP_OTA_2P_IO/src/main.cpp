@@ -1,6 +1,6 @@
 #define TINY_GSM_MODEM_SIM7600
-#define DUMP_AT_COMMANDS
 #define ENABLE_LCD
+#define DUMP_AT_COMMANDS
 
 #include <Wire.h>
 #include <TinyGsmClient.h>
@@ -10,14 +10,19 @@
 #include <LCD_I2C.h>
 #endif
 #include <esp_task_wdt.h>
-#include <driver/uart.h>
-#include "mbedtls/aes.h"
-#include "mbedtls/sha256.h"
-#include "certificates.h"
+#include <mbedtls/aes.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/pk.h>
 #include <esp_ota_ops.h>
-#include <map>
-#include <vector>
 #include <Preferences.h>
+#include <esp_random.h>
+#include <map> // Ensure std::map is included
+#include <vector>
+#include <certificates.h>
 
 // Hardware pins
 #define RGB_LED_PIN 48
@@ -30,26 +35,29 @@
 #define LED_PIN 13
 #define FACTORY_RESET_PIN 4
 
-// Default credentials
-#define DEFAULT_CLIENT_ID "ESP32_SIM7600_Client"
-#define DEFAULT_USERNAME "ESP32"
-#define DEFAULT_PASSWORD "12345"
+// Default credentials (randomized)
+String generateRandomString(size_t length)
+{
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    String result;
+    for (size_t i = 0; i < length; i++)
+    {
+        result += charset[esp_random() % (sizeof(charset) - 1)];
+    }
+    return result;
+}
+// String DEFAULT_CLIENT_ID = "ESP32_" + generateRandomString(8);
+// String DEFAULT_USERNAME = generateRandomString(12);
+// String DEFAULT_PASSWORD = generateRandomString(16);
+
+String DEFAULT_CLIENT_ID = "ESP32_SIM7600";
+String DEFAULT_USERNAME = "ESP32";
+String DEFAULT_PASSWORD = "12345";
 
 // APN configuration
 const char apn[] = "internet";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
-
-// AES-256 Configuration
-const unsigned char aes_key[32] = {
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-    0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-    0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46};
-const unsigned char aes_iv[16] = {
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-    0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46};
-
 
 // Serial interfaces
 HardwareSerial sim7600(1);
@@ -64,8 +72,24 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
-// State machine states (unchanged)
-enum SetupState {
+// Encryption and OTA settings
+unsigned char aes_key[32];    // Dynamically generated
+unsigned char device_key[32]; // For NVS encryption
+const char *SERVER_PUBLIC_KEY_PEM = "-----BEGIN PUBLIC KEY-----\n"
+                                    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcUqag9hF6FwK6OCEPD1leoTZYjAH\n"
+                                    "fMeNrht9Aiufk2jMGiQjIhnU22PM9Vt6XfdhNC7Qjd4xqBmCkFXsB0q2HA==\n"
+                                    "-----END PUBLIC KEY-----\n"; // Replace with actual server public key
+
+const unsigned char SERVER_PUBLIC_KEY[] = {
+    0x04, // Uncompressed point indicator
+    0x71, 0x52, 0xAA, 0x83, 0xD8, 0x45, 0xE8, 0x5C, 0x0A, 0xE8, 0xE0, 0x84, 0x3C, 0x3D, 0x65, 0x7A,
+    0x84, 0xD9, 0x62, 0x30, 0x07, 0xFC, 0xC7, 0x8D, 0xAE, 0x1B, 0x7D, 0x02, 0x2B, 0x9F, 0x93, 0x68,
+    0xCC, 0x1A, 0x24, 0x23, 0x22, 0x19, 0xD4, 0xDB, 0x63, 0xCC, 0xF5, 0x5B, 0x7A, 0x5D, 0xF7, 0x61,
+    0x34, 0x2E, 0xD0, 0x8D, 0xDE, 0x31, 0xA8, 0x19, 0x82, 0x90, 0x55, 0xEC, 0x07, 0x4A, 0xB6, 0x1C};
+
+// State machine states
+enum SetupState
+{
     STATE_INIT_MODEM,
     STATE_WAIT_NETWORK,
     STATE_CONNECT_GPRS,
@@ -77,42 +101,32 @@ enum SetupState {
     STATE_RUNNING,
     STATE_WAIT_PROVISION,
     STATE_ERROR,
-    STATE_STOPPED,
-    STATE_RECOVER_NETWORK,
-    STATE_RECOVER_GPRS,
     STATE_RECOVER_MQTT
 };
 
-struct MqttStatus {
-    bool serviceStarted = false;    // AT+CMQTTSTART succeeded
-    bool clientAcquired = false;    // AT+CMQTTACCQ succeeded
-    bool connected = false;         // AT+CMQTTCONNECT succeeded
-    bool subscribed = false;        // AT+CMQTTSUB succeeded for main topics
-    bool provisionSubscribed = false; // AT+CMQTTSUB succeeded for provisioning topic
-    int lastErrorCode = 0;          // Last MQTT-related error code (e.g., 19)
-    unsigned long lastConnectTime = 0; // Timestamp of last successful connection
-
-    // Reset all flags and status
-    void reset() {
-        serviceStarted = false;
-        clientAcquired = false;
-        connected = false;
-        subscribed = false;
-        provisionSubscribed = false;
+// MQTT status structure
+struct MqttStatus
+{
+    bool serviceStarted = false;
+    bool clientAcquired = false;
+    bool connected = false;
+    bool subscribed = false;
+    bool provisionSubscribed = false;
+    int lastErrorCode = 0;
+    unsigned long lastConnectTime = 0;
+    void reset()
+    {
+        serviceStarted = clientAcquired = connected = subscribed = provisionSubscribed = false;
         lastErrorCode = 0;
         lastConnectTime = 0;
     }
 };
 
-// Configuration (unchanged)
+// Configuration
 const int MAX_RETRIES = 10;
 const int RETRY_DELAY = 2000;
 const size_t OTA_CHUNK_SIZE = 1028;
 const size_t OTA_MAX_DATA_SIZE = OTA_CHUNK_SIZE - 4;
-const int BATCH_SIZE = 10;
-std::vector<unsigned long> batchChunks;
-unsigned long expectedBatchEnd = 0;
-
 const char *cert_name = "iot_inverter2.pem";
 const char *mqtt_server = "u008dd8e.ala.dedicated.aws.emqxcloud.com";
 #define PROVISION_TOPIC "dev_pass_req"
@@ -125,7 +139,7 @@ const unsigned long MONITOR_INTERVAL = 5000;
 const uint32_t WDT_TIMEOUT = 30;
 const size_t CHUNK_SIZE = 1024;
 
-// Global variables (unchanged except where noted)
+// Global variables
 SetupState currentState = STATE_INIT_MODEM;
 int retryCount = 0;
 uint8_t ledStatus = 0;
@@ -140,8 +154,7 @@ String clientID = DEFAULT_CLIENT_ID;
 String mqtt_user = DEFAULT_USERNAME;
 String mqtt_pass = DEFAULT_PASSWORD;
 MqttStatus mqttStatus;
-
-String imei = "";
+String deviceUUID;
 unsigned long lastMonitorTime = 0;
 String pendingTopic = "";
 String pendingPayload = "";
@@ -149,40 +162,26 @@ bool messageInProgress = false;
 int pendingTopicLen = 0;
 int pendingPayloadLen = 0;
 int receivedPayloadSize = 0;
-unsigned char decryptedBuffer[128];
-unsigned char encryptedBuffer[128];
 bool isProvisioned = false;
 Preferences preferences;
-bool factoryResetTriggered = false;
 bool waitingForProvisionResponse = false;
 unsigned long provisionTimeout = 1200000;
 unsigned long provisionStartTime = 0;
-const unsigned long PROVISION_REQUEST_INTERVAL = 10000;
-unsigned long PROVISION_RESTART_TIMEOUT = 120000;
+const unsigned long PROVISION_REQUEST_INTERVAL = 120000;
 unsigned long lastRequestTime = 0;
-static int publishRetryCount = 0;
-
+String otaSignature; // Base64-encoded ECDSA signature from OTA:BEGIN
 bool otaInProgress = false;
 unsigned long otaReceivedSize = 0;
 unsigned long otaTotalSize = 0;
 unsigned long chunkCount = 0;
-std::vector<unsigned long> missingChunks;
 std::map<unsigned long, bool> receivedChunks;
 esp_ota_handle_t otaHandle = 0;
 const esp_partition_t *updatePartition = NULL;
 const esp_partition_t *previousPartition = NULL;
-unsigned long bootTime = 0;
-unsigned long validationDelay = 60000;
-bool pendingValidation = false;
-unsigned int mqttErrors = 0;
-
 String otaHash = "";
 mbedtls_sha256_context sha256_ctx;
 
-
-
-
-// Base64 encoding/decoding tables
+// Base64 encoding/decoding tables (unchanged)
 static const char base64_enc_map[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static const unsigned char base64_dec_map[128] = {
     127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
@@ -197,18 +196,19 @@ static const unsigned char base64_dec_map[128] = {
 // Function declarations
 String base64_encode(const unsigned char *input, size_t len);
 size_t base64_decode(const char *input, unsigned char *output, size_t out_len);
-void printHex(const char *label, const unsigned char *data, size_t len);
 void pkcs7_pad(unsigned char *data, size_t data_len, size_t block_size);
 size_t pkcs7_unpad(unsigned char *data, size_t data_len);
-void check_firmware_partition();
-String encryptMessage(const char *message);
-String decryptMessage(const char *encryptedBase64);
+void generateEncryptionKeys();
+String encryptMessage(const char *message, unsigned char *iv_out);
+String decryptMessage(const char *encryptedBase64, const unsigned char *iv);
+void encryptNVSData(unsigned char *data, size_t len, unsigned char *out);
+void decryptNVSData(unsigned char *data, size_t len, unsigned char *out);
+bool verifyOTASignature(const unsigned char *firmware, size_t len, const unsigned char *signature, size_t sig_len);
 void handleMessage(String topic, String payload);
 bool tryStep(const String &stepMsg, bool success);
 void nextState(SetupState next);
 void retryState(const String &stepMsg);
 void resetModem();
-void resetState();
 void monitorConnections();
 void cleanupResources();
 void processURC(String urc);
@@ -227,15 +227,251 @@ void finishOTA();
 void checkMissingChunks();
 void revertToPreviousFirmware();
 void loadCredentials();
-void saveCredentials(String newPassword);
+void saveCredentials(String device_id, String username, String password); // Updated from two to three parameters
 bool requestCredentialsFromServer();
-bool republishProvisionRequest();
-void performFactoryReset();
 void resetCredentials();
-static void uart_event_task(void *pvParameters); // New UART interrupt task
+void performFactoryReset();
 
+void testECDH();
+void generateTestServerKey();
+String getIMEI();
 
-// Base64 encode function
+void resetCredentials()
+{
+    SerialMon.println("Resetting credentials for testing...");
+
+    // Open Preferences in read-write mode
+    preferences.begin("device-creds", false);
+
+    // Clear all stored data in the "device-creds" namespace
+    preferences.clear();
+
+    // Explicitly remove specific keys (redundant after clear, but ensures completeness)
+    preferences.remove("provisioned");
+    preferences.remove("device_id");
+    preferences.remove("username");
+    preferences.remove("password");
+    preferences.remove("nonce");
+    preferences.remove("ecdh_priv");
+
+    // Close Preferences
+    preferences.end();
+
+    // Reset in-memory variables to default values
+    isProvisioned = false;
+    clientID = DEFAULT_CLIENT_ID;
+    mqtt_user = DEFAULT_USERNAME;
+    mqtt_pass = DEFAULT_PASSWORD;
+    waitingForProvisionResponse = false;
+    provisionStartTime = 0;
+    lastRequestTime = 0;
+    mqttStatus.reset();
+
+    // Stop MQTT if running
+    if (mqttStatus.serviceStarted)
+    {
+        stopMQTT();
+    }
+
+    SerialMon.println("Credentials reset complete. Device is now in unprovisioned state.");
+    SerialMon.println("ClientID: " + clientID + ", Username: " + mqtt_user + ", Password: " + mqtt_pass);
+}
+
+String getIMEI()
+{
+    String imei = "";
+    modem.sendAT("+CGSN"); // Send command to get IMEI
+    String response;
+
+    String rawImei;
+    if (modem.waitResponse(1000L, rawImei) != 1)
+    {
+        SerialMon.println("Failed to retrieve IMEI");
+        imei = "Unknown";
+    }
+    else
+    {
+        imei = rawImei;
+        imei.replace("\r", "");
+        imei.replace("\n", "");
+        int okIndex = imei.indexOf("OK");
+        if (okIndex != -1)
+        {
+            imei = imei.substring(0, okIndex);
+        }
+        imei.trim();
+        SerialMon.print("Cleaned IMEI: ");
+        SerialMon.println(imei);
+    }
+    return imei;
+}
+
+void testECDH()
+{
+    mbedtls_ecdh_context ecdh;
+    mbedtls_pk_context pk;
+    mbedtls_ecdh_init(&ecdh);
+    mbedtls_pk_init(&pk);
+
+    SerialMon.println("Test: Loading curve SECP256R1");
+    if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+    {
+        SerialMon.println("Test: Failed to load curve");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    // Parse the PEM public key
+    SerialMon.println("Test: Parsing server public key from PEM");
+    if (mbedtls_pk_parse_public_key(&pk, (const unsigned char *)SERVER_PUBLIC_KEY_PEM, strlen(SERVER_PUBLIC_KEY_PEM) + 1) != 0)
+    {
+        SerialMon.println("Test: Failed to parse PEM server public key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    // Ensure it's an EC key
+    if (mbedtls_pk_get_type(&pk) != MBEDTLS_PK_ECKEY)
+    {
+        SerialMon.println("Test: Parsed key is not an EC key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    mbedtls_ecp_keypair *ec_key = mbedtls_pk_ec(pk);
+    if (!ec_key)
+    {
+        SerialMon.println("Test: Failed to get EC keypair from parsed key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    // Verify the curve matches SECP256R1
+    if (ec_key->grp.id != MBEDTLS_ECP_DP_SECP256R1)
+    {
+        SerialMon.println("Test: Server public key curve does not match SECP256R1");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    // Copy the public key point (Q) to ecdh.Qp
+    if (mbedtls_ecp_copy(&ecdh.Qp, &ec_key->Q) != 0)
+    {
+        SerialMon.println("Test: Failed to copy server public key point");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    // Validate the public key
+    if (mbedtls_ecp_check_pubkey(&ecdh.grp, &ecdh.Qp) != 0)
+    {
+        SerialMon.println("Test: Server public key is invalid for SECP256R1");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+    SerialMon.println("Test: Server public key is valid");
+
+    // Print the public key for debugging
+    unsigned char pubkey[65];
+    pubkey[0] = 0x04; // Uncompressed format
+    if (mbedtls_mpi_write_binary(&ecdh.Qp.X, pubkey + 1, 32) != 0 ||
+        mbedtls_mpi_write_binary(&ecdh.Qp.Y, pubkey + 33, 32) != 0)
+    {
+        SerialMon.println("Test: Failed to serialize public key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+    SerialMon.print("Test: Server public key (binary): ");
+    for (int i = 0; i < 65; i++)
+        SerialMon.printf("%02x", pubkey[i]);
+    SerialMon.println();
+
+    // Load private key from NVS
+    unsigned char ecdh_priv[32];
+    preferences.begin("device-creds", true);
+    preferences.getBytes("ecdh_priv", ecdh_priv, 32);
+    preferences.end();
+
+    SerialMon.print("Test: Private key from NVS: ");
+    for (int i = 0; i < 32; i++)
+        SerialMon.printf("%02x", ecdh_priv[i]);
+    SerialMon.println();
+
+    if (mbedtls_mpi_read_binary(&ecdh.d, ecdh_priv, 32) != 0)
+    {
+        SerialMon.println("Test: Failed to load private key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+
+    if (mbedtls_ecp_check_privkey(&ecdh.grp, &ecdh.d) != 0)
+    {
+        SerialMon.println("Test: Private key is invalid for SECP256R1");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdh_free(&ecdh);
+        return;
+    }
+    SerialMon.println("Test: Private key is valid");
+
+    // Compute shared secret
+    unsigned char shared_secret[32];
+    size_t olen;
+    int ret = mbedtls_ecdh_calc_secret(&ecdh, &olen, shared_secret, 32, NULL, NULL);
+    if (ret != 0)
+    {
+        SerialMon.println("Test: Failed to compute shared secret, error code: " + String(ret));
+    }
+    else
+    {
+        SerialMon.print("Test: Shared secret: ");
+        for (int i = 0; i < 32; i++)
+            SerialMon.printf("%02x", shared_secret[i]);
+        SerialMon.println();
+        SerialMon.println("Test: Shared secret length: " + String(olen));
+    }
+
+    // Cleanup (automatically called when objects go out of scope, but explicit for clarity)
+    mbedtls_pk_free(&pk);
+    mbedtls_ecdh_free(&ecdh);
+}
+
+void generateTestServerKey()
+{
+    mbedtls_ecdh_context ecdh;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+    mbedtls_ecdh_init(&ecdh);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
+    mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1);
+    mbedtls_ecdh_gen_public(&ecdh.grp, &ecdh.d, &ecdh.Q, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+    unsigned char test_pubkey[65];
+    test_pubkey[0] = 0x04;
+    mbedtls_mpi_write_binary(&ecdh.Q.X, test_pubkey + 1, 32);
+    mbedtls_mpi_write_binary(&ecdh.Q.Y, test_pubkey + 33, 32);
+    SerialMon.print("Test server public key: ");
+    for (int i = 0; i < 65; i++)
+        SerialMon.printf("%02x", test_pubkey[i]);
+    SerialMon.println();
+
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_ecdh_free(&ecdh);
+}
+
+// Base64 functions (unchanged)
 String base64_encode(const unsigned char *input, size_t len)
 {
     String output = "";
@@ -247,13 +483,11 @@ String base64_encode(const unsigned char *input, size_t len)
         if (j == 3 || i == len)
         {
             char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((j > 1 ? char_array_3[1] : 0) >> 4);
-            char_array_4[2] = j > 1 ? ((char_array_3[1] & 0x0f) << 2) + ((j > 2 ? char_array_3[2] : 0) >> 6) : 0;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((j > 1 ? (char_array_3[1] & 0xf0) : 0) >> 4); // Fixed
+            char_array_4[2] = j > 1 ? ((char_array_3[1] & 0x0f) << 2) + ((j > 2 ? (char_array_3[2] & 0xc0) : 0) >> 6) : 0;
             char_array_4[3] = j > 2 ? (char_array_3[2] & 0x3f) : 0;
             for (int k = 0; k < (j + 1); k++)
-            {
                 output += base64_enc_map[char_array_4[k]];
-            }
             while (j++ < 3)
                 output += '=';
             j = 0;
@@ -262,7 +496,6 @@ String base64_encode(const unsigned char *input, size_t len)
     return output;
 }
 
-// Base64 decode function
 size_t base64_decode(const char *input, unsigned char *output, size_t out_len)
 {
     size_t in_len = strlen(input);
@@ -286,29 +519,12 @@ size_t base64_decode(const char *input, unsigned char *output, size_t out_len)
     return out_pos;
 }
 
-// Utility function to print hex
-void printHex(const char *label, const unsigned char *data, size_t len)
-{
-    SerialMon.print(label);
-    for (size_t i = 0; i < len; i++)
-    {
-        if (data[i] < 0x10)
-            SerialMon.print("0");
-        SerialMon.print(data[i], HEX);
-        if (i < len - 1)
-            SerialMon.print(" ");
-    }
-    SerialMon.println();
-}
-
-// PKCS7 padding/unpadding functions
+// Padding functions (unchanged)
 void pkcs7_pad(unsigned char *data, size_t data_len, size_t block_size)
 {
     unsigned char pad_value = block_size - (data_len % block_size);
     for (size_t i = data_len; i < data_len + pad_value; i++)
-    {
         data[i] = pad_value;
-    }
 }
 
 size_t pkcs7_unpad(unsigned char *data, size_t data_len)
@@ -319,27 +535,163 @@ size_t pkcs7_unpad(unsigned char *data, size_t data_len)
     return data_len - pad_value;
 }
 
-// Setup function with UART interrupt initialization
-void setup() {
+// Security functions
+void generateEncryptionKeys()
+{
+    esp_fill_random(aes_key, 32);
+    esp_fill_random(device_key, 32);
+}
+
+String encryptMessage(const char *message, unsigned char *iv_out)
+{
+    if (!message)
+        return "";
+    size_t input_len = strlen(message);
+    size_t padded_len = ((input_len + 15) / 16) * 16;
+    unsigned char *padded_input = new unsigned char[padded_len]();
+    memcpy(padded_input, message, input_len);
+    pkcs7_pad(padded_input, input_len, 16);
+
+    unsigned char iv[16];
+    esp_fill_random(iv, 16);
+    memcpy(iv_out, iv, 16);
+
+    unsigned char *output_buffer = new unsigned char[padded_len]();
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, aes_key, 256);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv, padded_input, output_buffer);
+    mbedtls_aes_free(&aes);
+
+    String result = base64_encode(output_buffer, padded_len);
+    delete[] padded_input;
+    delete[] output_buffer;
+    return result;
+}
+
+String decryptMessage(const char *encryptedBase64, const unsigned char *iv)
+{
+    if (!encryptedBase64)
+        return "";
+    size_t max_input_len = strlen(encryptedBase64);
+    unsigned char *encrypted_bytes = new unsigned char[max_input_len]();
+    size_t decoded_len = base64_decode(encryptedBase64, encrypted_bytes, max_input_len);
+    if (decoded_len < 16)
+    {
+        delete[] encrypted_bytes;
+        return "";
+    }
+    unsigned char *output_buffer = new unsigned char[decoded_len - 16]();
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, aes_key, 256);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, decoded_len - 16, (unsigned char *)iv, encrypted_bytes + 16, output_buffer);
+    mbedtls_aes_free(&aes);
+
+    size_t unpadded_len = pkcs7_unpad(output_buffer, decoded_len - 16);
+    String result = String((char *)output_buffer, unpadded_len);
+    delete[] encrypted_bytes;
+    delete[] output_buffer;
+    return result;
+}
+
+void encryptNVSData(unsigned char *data, size_t len, unsigned char *out)
+{
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, device_key, 256);
+    unsigned char iv[16] = {0}; // Fixed for simplicity; improve in production
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, len, iv, data, out);
+    mbedtls_aes_free(&aes);
+}
+
+void decryptNVSData(unsigned char *data, size_t len, unsigned char *out)
+{
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, device_key, 256);
+    unsigned char iv[16] = {0};
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, len, iv, data, out);
+    mbedtls_aes_free(&aes);
+}
+
+bool verifyOTASignature(const unsigned char *firmware, size_t len, const unsigned char *signature, size_t sig_len)
+{
+    mbedtls_ecdsa_context ecdsa;
+    mbedtls_pk_context pk;
+    mbedtls_ecdsa_init(&ecdsa);
+    mbedtls_pk_init(&pk);
+
+    if (mbedtls_ecp_group_load(&ecdsa.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+    {
+        SerialMon.println("Failed to load curve");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdsa_free(&ecdsa);
+        return false;
+    }
+
+    if (mbedtls_pk_parse_public_key(&pk, (const unsigned char *)SERVER_PUBLIC_KEY_PEM, strlen(SERVER_PUBLIC_KEY_PEM) + 1) != 0)
+    {
+        SerialMon.println("Failed to parse server public key PEM");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdsa_free(&ecdsa);
+        return false;
+    }
+
+    mbedtls_ecp_keypair *ec_key = mbedtls_pk_ec(pk);
+    if (!ec_key || mbedtls_ecp_copy(&ecdsa.Q, &ec_key->Q) != 0)
+    {
+        SerialMon.println("Failed to extract EC public key");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdsa_free(&ecdsa);
+        return false;
+    }
+
+    unsigned char hash[32];
+    mbedtls_sha256(firmware, len, hash, 0);
+
+    if (sig_len != 64)
+    {
+        SerialMon.println("Invalid signature length");
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdsa_free(&ecdsa);
+        return false;
+    }
+
+    mbedtls_mpi r, s;
+    mbedtls_mpi_init(&r);
+    mbedtls_mpi_init(&s);
+    if (mbedtls_mpi_read_binary(&r, signature, 32) != 0 ||
+        mbedtls_mpi_read_binary(&s, signature + 32, 32) != 0)
+    {
+        SerialMon.println("Failed to parse signature components");
+        mbedtls_mpi_free(&r);
+        mbedtls_mpi_free(&s);
+        mbedtls_pk_free(&pk);
+        mbedtls_ecdsa_free(&ecdsa);
+        return false;
+    }
+
+    int ret = mbedtls_ecdsa_verify(&ecdsa.grp, hash, 32, &ecdsa.Q, &r, &s);
+    mbedtls_mpi_free(&r);
+    mbedtls_mpi_free(&s);
+    mbedtls_pk_free(&pk);
+    mbedtls_ecdsa_free(&ecdsa);
+    return ret == 0;
+}
+
+// Setup
+void setup()
+{
     esp_task_wdt_reset();
     SerialMon.begin(115200);
-    delay(1000);
-    SerialMon.println("Starting...");
-
-    mqttStatus.reset();
-    otaInProgress = false;
-    otaReceivedSize = 0;
-    otaTotalSize = 0;
-    chunkCount = 0;
-    receivedChunks.clear();
-    missingChunks.clear();
-
-    sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); // Sole UART access via TinyGsm
+   
+    generateEncryptionKeys();
+    sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     esp_task_wdt_init(WDT_TIMEOUT * 1000, true);
     esp_task_wdt_add(NULL);
 
     pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
-    check_firmware_partition();
     pinMode(SIM7600_PWR, OUTPUT);
     digitalWrite(SIM7600_PWR, LOW);
     delay(1500);
@@ -352,334 +704,306 @@ void setup() {
     lcd.backlight();
     lcd.print("Connecting...");
     lcdAvailable = true;
-#else
-    lcdAvailable = false;
 #endif
+
+    // For debugging purpose
+  //  resetCredentials();
 
     rgbLed.begin();
     rgbLed.show();
-    resetCredentials();
-    bootTime = millis();
+    loadCredentials();
 
-    if (tryStep("Initializing modem", modem.init())) {
-        SerialMon.println("Modem initialized: " + modem.getModemInfo());
-        modem.sendAT("+CGSN");
-        String rawImei;
-        if (modem.waitResponse(1000L, rawImei) != 1) {
-            SerialMon.println("Failed to retrieve IMEI");
-            imei = "Unknown";
-        } else {
-            imei = rawImei;
-            imei.replace("\r", "");
-            imei.replace("\n", "");
-            int okIndex = imei.indexOf("OK");
-            if (okIndex != -1) {
-                imei = imei.substring(0, okIndex);
-            }
-            imei.trim();
-            SerialMon.print("Cleaned IMEI: ");
-            SerialMon.println(imei);
-        }
-        loadCredentials();
-        bootTime = millis();
-        nextState(STATE_WAIT_NETWORK);
-    }
+    SerialMon.println("This is Updated OTA Firmware");
+    // generateTestServerKey();
+    // testECDH();
 }
 
-void loop() {
+// Loop
+void loop()
+{
     esp_task_wdt_reset();
-    if (digitalRead(FACTORY_RESET_PIN) == LOW) {
+    if (digitalRead(FACTORY_RESET_PIN) == LOW)
+    {
         delay(50);
-        if (digitalRead(FACTORY_RESET_PIN) == LOW) {
-            factoryResetTriggered = true;
+        if (digitalRead(FACTORY_RESET_PIN) == LOW)
+        {
             performFactoryReset();
         }
     }
 
-    // Poll for URCs
-    while (SerialAT.available()) {
+    while (SerialAT.available())
+    {
         String urc = SerialAT.readStringUntil('\n');
         processURC(urc);
     }
 
-    switch (currentState) {
-        case STATE_INIT_MODEM:
-            if (tryStep("Initializing modem", modem.init())) {
-                modem.sendAT("+CGSN");
-                if (modem.waitResponse(1000L, imei) != 1) {
-                    imei = "Unknown";
-                } else {
-                    imei.trim();
+    // SerialMon.println("Current state: " + String(currentState)); // Log current state
+    switch (currentState)
+    {
+    case STATE_INIT_MODEM:
+        if (tryStep("Initializing modem", modem.init()))
+            
+        if ( getIMEI() != "Unknown")
+        {
+            deviceUUID = getIMEI();
+            nextState(STATE_WAIT_NETWORK);
+        }
+        break;
+    case STATE_WAIT_NETWORK:
+        if (tryStep("Waiting for network", modem.waitForNetwork()))
+            nextState(STATE_CONNECT_GPRS);
+        break;
+    case STATE_CONNECT_GPRS:
+        if (tryStep("Connecting to " + String(apn), modem.gprsConnect(apn, gprsUser, gprsPass)))
+            nextState(STATE_UPLOAD_CERTIFICATE);
+        break;
+    case STATE_UPLOAD_CERTIFICATE:
+        if (tryStep("Uploading certificate", uploadCertificate()))
+            nextState(STATE_SETUP_SSL);
+        break;
+    case STATE_SETUP_SSL:
+        if (tryStep("Setting up SSL", setupSSL()))
+            nextState(STATE_SETUP_MQTT);
+        break;
+    case STATE_SETUP_MQTT:
+        SerialMon.println("Entering STATE_SETUP_MQTT, isProvisioned: " + String(isProvisioned));
+        if (tryStep("Setting up MQTT", setupMQTT()))
+            nextState(STATE_CONNECT_MQTT);
+        break;
+    case STATE_CONNECT_MQTT:
+        SerialMon.println("Entering STATE_CONNECT_MQTT, attempting connection...");
+        if (tryStep("Connecting to MQTT", connectMQTT()))
+        {
+            SerialMon.println("MQTT connection successful, isProvisioned: " + String(isProvisioned));
+            nextState(STATE_SUBSCRIBE_MQTT);
+        }
+        break;
+    case STATE_SUBSCRIBE_MQTT:
+        SerialMon.println("Entering STATE_SUBSCRIBE_MQTT, isProvisioned: " + String(isProvisioned));
+        if (!isProvisioned)
+        {
+            if (tryStep("Subscribing to provisioning topic", subscribeMQTT(PROVISION_RESPONSE_TOPIC)))
+            {
+                if (requestCredentialsFromServer())
+                {
+                    mqttStatus.provisionSubscribed = true;
+                    nextState(STATE_WAIT_PROVISION);
                 }
-                nextState(STATE_WAIT_NETWORK);
-            }
-            break;
-
-        case STATE_WAIT_NETWORK:
-            if (tryStep("Waiting for network", modem.waitForNetwork())) {
-                nextState(STATE_CONNECT_GPRS);
-            }
-            break;
-
-        case STATE_CONNECT_GPRS:
-            if (tryStep("Connecting to " + String(apn), modem.gprsConnect(apn, gprsUser, gprsPass))) {
-                nextState(STATE_UPLOAD_CERTIFICATE);
-            }
-            break;
-
-        case STATE_UPLOAD_CERTIFICATE:
-            if (tryStep("Uploading certificate", uploadCertificate())) {
-                nextState(STATE_SETUP_SSL);
-            }
-            break;
-
-        case STATE_SETUP_SSL:
-            if (tryStep("Setting up SSL", setupSSL())) {
-                nextState(STATE_SETUP_MQTT);
-            }
-            break;
-
-        case STATE_SETUP_MQTT:
-            if (tryStep("Setting up MQTT", setupMQTT())) {
-                if (!isProvisioned) {
-                    if (requestCredentialsFromServer()) {
-                        nextState(STATE_WAIT_PROVISION);
-                    } else {
-                        nextState(STATE_ERROR);
-                    }
-                } else {
-                    nextState(STATE_CONNECT_MQTT);
+                else
+                {
+                    nextState(STATE_ERROR);
                 }
             }
-            break;
-
-        case STATE_WAIT_PROVISION:
-            if (millis() - provisionStartTime >= provisionTimeout) {
-                SerialMon.println("Provisioning timeout exceeded");
-                waitingForProvisionResponse = false;
-                stopMQTT();
-                nextState(STATE_ERROR);
-            } else if (millis() - lastRequestTime >= PROVISION_REQUEST_INTERVAL) {
-                republishProvisionRequest();
-            }
-            break;
-
-        case STATE_CONNECT_MQTT:
-            if (tryStep("Connecting to MQTT", connectMQTT())) {
-                nextState(STATE_SUBSCRIBE_MQTT);
-            }
-            break;
-
-        case STATE_SUBSCRIBE_MQTT:
-            if (tryStep("Subscribing to MQTT", subscribeMQTT())) {
+        }
+        else
+        {
+            if (tryStep("Subscribing to MQTT", subscribeMQTT()))
                 nextState(STATE_RUNNING);
-            }
-            break;
-
-        case STATE_RUNNING:
-            if (millis() - lastMonitorTime >= MONITOR_INTERVAL) {
-                monitorConnections();
-                lastMonitorTime = millis();
-            }
-            break;
-
-        case STATE_ERROR:
-            SerialMon.println("Setup failed, cleaning up...");
-            cleanupResources();
-            resetModem();
-            nextState(STATE_INIT_MODEM);
-            break;
-
-        case STATE_RECOVER_MQTT:
-            if (tryStep("Recovering MQTT", connectMQTT() && subscribeMQTT())) {
-                nextState(STATE_RUNNING);
-            }
-            break;
+        }
+        break;
+    case STATE_WAIT_PROVISION:
+        if (SerialAT.available())
+        {
+            String urc = SerialAT.readStringUntil('\n');
+            processURC(urc);
+            SerialMon.println("Provision URC Called");
+        }
+        if (millis() - provisionStartTime >= provisionTimeout)
+        {
+            SerialMon.println("Provisioning timeout");
+            waitingForProvisionResponse = false;
+            preferences.begin("device-creds", false);
+            preferences.remove("nonce"); // Clear on timeout
+            preferences.remove("ecdh_priv");
+            preferences.end();
+            stopMQTT();
+            nextState(STATE_ERROR);
+        }
+        else if (millis() - lastRequestTime >= PROVISION_REQUEST_INTERVAL)
+        {
+            requestCredentialsFromServer();
+            SerialMon.printf("Provision request resent at %lu ms\n", millis());
+        }
+        break;
+    case STATE_RUNNING:
+        if (millis() - lastMonitorTime >= MONITOR_INTERVAL)
+        {
+            monitorConnections();
+            lastMonitorTime = millis();
+            SerialMon.println("This is Updated OTA Firmware");
+        }
+        break;
+    case STATE_ERROR:
+        SerialMon.println("Setup failed");
+        cleanupResources();
+        resetModem();
+        nextState(STATE_INIT_MODEM);
+        break;
+    case STATE_RECOVER_MQTT:
+        if (tryStep("Recovering MQTT", connectMQTT() && subscribeMQTT()))
+            nextState(STATE_RUNNING);
+        break;
     }
 }
 
-String encryptMessage(const char *message)
-{
-    if (!message)
-        return "";
-    size_t input_len = strlen(message);
-    if (input_len == 0)
-        return "";
-    size_t padded_len = ((input_len + 15) / 16) * 16;
-    if (padded_len > 1024)
-    {
-        SerialMon.println("Message too long: " + String(input_len));
-        return "";
-    }
-    unsigned char *padded_input = new unsigned char[padded_len]();
-    if (!padded_input)
-        return "";
-    memcpy(padded_input, message, input_len);
-    pkcs7_pad(padded_input, input_len, 16);
-    unsigned char *output_buffer = new unsigned char[padded_len]();
-    if (!output_buffer)
-    {
-        delete[] padded_input;
-        return "";
-    }
-    mbedtls_aes_context aes;
-    unsigned char iv[16];
-    memcpy(iv, aes_iv, 16);
-    mbedtls_aes_init(&aes);
-    int key_ret = mbedtls_aes_setkey_enc(&aes, aes_key, 256);
-    if (key_ret != 0)
-    {
-        delete[] padded_input;
-        delete[] output_buffer;
-        return "";
-    }
-    int ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv,
-                                    padded_input, output_buffer);
-    mbedtls_aes_free(&aes);
-    String result;
-    if (ret == 0)
-    {
-        result = base64_encode(output_buffer, padded_len);
-    }
-    delete[] padded_input;
-    delete[] output_buffer;
-    return result;
-}
-
-String decryptMessage(const char *encryptedBase64)
-{
-    if (!encryptedBase64 || strlen(encryptedBase64) == 0)
-        return "";
-    size_t max_input_len = strlen(encryptedBase64);
-    if (max_input_len > 1024)
-        return "";
-    unsigned char *encrypted_bytes = new unsigned char[max_input_len]();
-    if (!encrypted_bytes)
-        return "";
-    size_t decoded_len = base64_decode(encryptedBase64, encrypted_bytes, max_input_len);
-    if (decoded_len == 0 || decoded_len % 16 != 0)
-    {
-        delete[] encrypted_bytes;
-        return "";
-    }
-    unsigned char *output_buffer = new unsigned char[decoded_len]();
-    if (!output_buffer)
-    {
-        delete[] encrypted_bytes;
-        return "";
-    }
-    mbedtls_aes_context aes;
-    unsigned char iv[16];
-    memcpy(iv, aes_iv, 16);
-    mbedtls_aes_init(&aes);
-    int key_ret = mbedtls_aes_setkey_dec(&aes, aes_key, 256);
-    if (key_ret != 0)
-    {
-        delete[] encrypted_bytes;
-        delete[] output_buffer;
-        return "";
-    }
-    int ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, decoded_len, iv,
-                                    encrypted_bytes, output_buffer);
-    mbedtls_aes_free(&aes);
-    String result;
-    if (ret == 0)
-    {
-        size_t unpadded_len = pkcs7_unpad(output_buffer, decoded_len);
-        result = String((char *)output_buffer, unpadded_len);
-    }
-    delete[] encrypted_bytes;
-    delete[] output_buffer;
-    return result;
-}
-
+// MQTT and OTA functions (partial implementation; integrate with existing logic)
 void handleMessage(String topic, String payload)
 {
-    SerialMon.println("Received on topic: " + topic + ", Payload: " + payload);
-
-    if (topic == "server_cmd")
+    SerialMon.println("Received message on " + topic + ": " + payload);
+    if (topic == PROVISION_RESPONSE_TOPIC && waitingForProvisionResponse)
     {
-        String decrypted = decryptMessage(payload.c_str());
-        if (decrypted.length() == 0)
+        if (payload.startsWith("CREDENTIALS:"))
         {
-            SerialMon.println("Failed to decrypt message from " + topic);
-            return;
-        }
-        if (decrypted == "RESET_PASSWORD")
-        {
-            resetCredentials();
-            publishMQTT(PROVISION_TOPIC, "Password reset requested");
-            return;
-        }
-        publishMQTT(mqtt_topic_send, decrypted.c_str());
-        String prefixedMessage = imei + decrypted;
-        String encryptedPrefixed = encryptMessage(prefixedMessage.c_str());
-        if (encryptedPrefixed.length() > 0)
-        {
-            publishMQTT(mqtt_topic_send, encryptedPrefixed.c_str());
-        }
-        ledStatus = !ledStatus;
-        digitalWrite(LED_PIN, ledStatus);
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("MQTT Msg:");
-            lcd.setCursor(0, 1);
-            lcd.print(decrypted.substring(0, 16));
-        }
-#endif
-    }
-    else if (topic == PROVISION_RESPONSE_TOPIC && !isProvisioned && waitingForProvisionResponse)
-    {
-        String decrypted = decryptMessage(payload.c_str());
-      if (decrypted.startsWith("PASSWORD:"))
-        {
-            String newPassword = decrypted.substring(9);
-            saveCredentials(newPassword);
-            SerialMon.println("Received new password: " + newPassword);
-
-            disconnectMQTT();
-            if (!stopMQTT())
+            String encrypted_b64 = payload.substring(11);
+            encrypted_b64.trim();
+            if (encrypted_b64.startsWith(":"))
             {
-                SerialMon.println("Failed to stop MQTT, forcing full reset");
-                resetState();
-                nextState(STATE_INIT_MODEM);
+                encrypted_b64 = encrypted_b64.substring(1);
+            }
+            SerialMon.println("Final Base64 to decode: [" + encrypted_b64 + "]");
+
+            unsigned char encrypted_bytes[1024];
+            size_t enc_len = base64_decode(encrypted_b64.c_str(), encrypted_bytes, 1024);
+            SerialMon.println("Decoded length: " + String(enc_len));
+
+            if (enc_len == 0)
+            {
+                SerialMon.println("Failed to decode Base64 data");
                 return;
             }
 
+            preferences.begin("device-creds", true);
+            unsigned char iv[16], ecdh_priv[32];
+            preferences.getBytes("nonce", iv, 16);
+            preferences.getBytes("ecdh_priv", ecdh_priv, 32);
+            preferences.end();
+
+            SerialMon.print("Private key from NVS: ");
+            for (int i = 0; i < 32; i++)
+                SerialMon.printf("%02x", ecdh_priv[i]);
+            SerialMon.println();
+
+            mbedtls_ecdh_context ecdh;
+            mbedtls_pk_context pk;
+            mbedtls_ecdh_init(&ecdh);
+            mbedtls_pk_init(&pk);
+
+            if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+            {
+                SerialMon.println("Failed to load curve");
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            if (mbedtls_mpi_read_binary(&ecdh.d, ecdh_priv, 32) != 0)
+            {
+                SerialMon.println("Failed to load private key");
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            if (mbedtls_pk_parse_public_key(&pk, (const unsigned char *)SERVER_PUBLIC_KEY_PEM, strlen(SERVER_PUBLIC_KEY_PEM) + 1) != 0)
+            {
+                SerialMon.println("Failed to parse server public key PEM");
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            mbedtls_ecp_keypair *ec_key = mbedtls_pk_ec(pk);
+            if (!ec_key || mbedtls_ecp_copy(&ecdh.Qp, &ec_key->Q) != 0)
+            {
+                SerialMon.println("Failed to extract server public key");
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            unsigned char shared_secret[32];
+            size_t olen;
+            int ret = mbedtls_ecdh_calc_secret(&ecdh, &olen, shared_secret, 32, NULL, NULL);
+            if (ret != 0)
+            {
+                SerialMon.println("Failed to compute shared secret, error code: " + String(ret));
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+            SerialMon.print("Shared secret: ");
+            for (int i = 0; i < 32; i++)
+                SerialMon.printf("%02x", shared_secret[i]);
+            SerialMon.println();
+
+            unsigned char derived_key[32];
+            mbedtls_sha256(shared_secret, 32, derived_key, 0);
+            SerialMon.print("Derived key: ");
+            for (int i = 0; i < 32; i++)
+                SerialMon.printf("%02x", derived_key[i]);
+            SerialMon.println();
+
+            mbedtls_aes_context aes;
+            mbedtls_aes_init(&aes);
+            if (mbedtls_aes_setkey_dec(&aes, derived_key, 256) != 0)
+            {
+                SerialMon.println("Failed to set AES decryption key");
+                mbedtls_aes_free(&aes);
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            unsigned char decrypted[1024];
+            size_t padded_len = ((enc_len + 15) / 16) * 16;
+            if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, padded_len, iv, encrypted_bytes, decrypted) != 0)
+            {
+                SerialMon.println("AES decryption failed");
+                mbedtls_aes_free(&aes);
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            size_t unpadded_len = pkcs7_unpad(decrypted, padded_len);
+            String creds = String((char *)decrypted, unpadded_len);
+            SerialMon.println("Decrypted credentials: " + creds);
+
+            int deviceIdStart = creds.indexOf("DEVICE_ID:") + 10;
+            int usernameStart = creds.indexOf(":USERNAME:");
+            int passwordStart = creds.indexOf(":PASSWORD:");
+            if (deviceIdStart < 10 || usernameStart == -1 || passwordStart == -1)
+            {
+                SerialMon.println("Invalid credential format");
+                mbedtls_aes_free(&aes);
+                mbedtls_pk_free(&pk);
+                mbedtls_ecdh_free(&ecdh);
+                return;
+            }
+
+            String device_id = creds.substring(deviceIdStart, usernameStart);
+            String username = creds.substring(usernameStart + 10, passwordStart);
+            String password = creds.substring(passwordStart + 10);
+
+            saveCredentials(device_id, username, password);
+            clientID = device_id;
             waitingForProvisionResponse = false;
-            mqttStatus.provisionSubscribed = false;  // Reset subscription flag
-            if (currentState == STATE_WAIT_PROVISION)
-            {
-                nextState(STATE_CONNECT_MQTT);
-            }
-            else
-            {
-                SerialMon.println("Unexpected state during provisioning: " + String(currentState));
-                nextState(STATE_SETUP_MQTT);
-            }
-        }
-        else
-        {
-            SerialMon.println("Invalid provisioning response");
-           // waitingForProvisionResponse = false;
-            nextState(STATE_ERROR);
+            preferences.begin("device-creds", false);
+            preferences.remove("nonce");     // Clear nonce on success
+            preferences.remove("ecdh_priv"); // Clear private key
+            preferences.end();
+            stopMQTT();
+            nextState(STATE_SETUP_MQTT);
+
+            mbedtls_aes_free(&aes);
+            mbedtls_pk_free(&pk);
+            mbedtls_ecdh_free(&ecdh);
+            return;
         }
     }
-    else if (topic == "OTA_Update")
+    else if (topic == mqtt_topic_firmware)
     {
-        if (payload == "reverse old firmware" && pendingValidation)
-        {
-            revertToPreviousFirmware();
-        }
-        else
-        {
-            SerialMon.println("OTA_Update matched, calling processOTAFirmware");
-            byte *payloadBytes = (byte *)payload.c_str();
-            unsigned int payloadLen = payload.length();
-            processOTAFirmware(topic, payloadBytes, payloadLen);
-        }
+        processOTAFirmware(topic, (byte *)payload.c_str(), payload.length());
     }
 }
 
@@ -708,18 +1032,12 @@ void retryState(const String &stepMsg)
     retryCount++;
     if (retryCount >= MAX_RETRIES)
     {
-        SerialMon.println("Max retries reached for " + stepMsg);
-        if (currentState >= STATE_CONNECT_MQTT)
-        {
-            disconnectMQTT();
-            stopMQTT();
-        }
-        resetModem();
-        resetState();
+        SerialMon.println("Max retries for " + stepMsg);
+        nextState(STATE_ERROR);
     }
     else
     {
-        delay(RETRY_DELAY);
+        delay(RETRY_DELAY * (retryCount + 1));
     }
 }
 
@@ -730,29 +1048,7 @@ void resetModem()
     delay(1500);
     digitalWrite(SIM7600_PWR, HIGH);
     delay(5000);
-    mqttStatus.serviceStarted = false; // Reset flag since modem is restarted
-}
-
-void resetState()
-{
-    SerialMon.println("Resetting state data...");
-    currentState = STATE_INIT_MODEM;
-    retryCount = 0;
-    if (otaInProgress)
-    {
-        cleanupResources();
-    }
-    ledStatus = 0;
-    digitalWrite(LED_PIN, ledStatus);
-    rgbLed.setPixelColor(0, 0, 0, 0);
-    rgbLed.show();
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Resetting...");
-    }
-#endif
+    mqttStatus.reset();
 }
 
 void monitorConnections()
@@ -760,30 +1056,17 @@ void monitorConnections()
     if (!modem.isNetworkConnected())
     {
         SerialMon.println("Network lost");
-        if (otaInProgress)
-        {
-            SerialMon.println("OTA interrupted by network loss");
-            cleanupResources();
-            publishMQTT(mqtt_topic_send, "OTA:ERROR:Network lost");
-        }
-        nextState(STATE_RECOVER_NETWORK);
+        nextState(STATE_ERROR);
     }
     else if (!modem.isGprsConnected())
     {
-        SerialMon.println("GPRS disconnected");
-        if (otaInProgress)
-        {
-            SerialMon.println("OTA interrupted by GPRS loss");
-            cleanupResources();
-            publishMQTT(mqtt_topic_send, "OTA:ERROR:GPRS lost");
-        }
-        nextState(STATE_RECOVER_GPRS);
+        SerialMon.println("GPRS lost");
+        nextState(STATE_ERROR);
     }
 }
 
 void cleanupResources()
 {
-    SerialMon.println("Cleaning up resources...");
     modem.gprsDisconnect();
     stopMQTT();
     if (otaInProgress)
@@ -794,71 +1077,83 @@ void cleanupResources()
         otaTotalSize = 0;
         chunkCount = 0;
         receivedChunks.clear();
-        missingChunks.clear();
-        SerialMon.println("OTA data cleared due to cleanup");
-    }    
-    pendingTopic = "";
-    pendingPayload = "";
-    publishRetryCount = 0;  // Reset on success
-    waitingForProvisionResponse = false; // Reset provisioning flag
+    }
 }
 
-void processURC(String urc) {
+void processURC(String urc)
+{
     urc.trim();
-    if (urc.length() > 0) {
+    if (urc.length() > 0)
+    {
         SerialMon.println("URC: " + urc);
     }
-    if (urc.startsWith("+CMQTTCONNLOST: 0,")) {
+    if (urc.startsWith("+CMQTTCONNLOST: 0,"))
+    {
         SerialMon.println("MQTT connection lost detected");
         mqttStatus.connected = false;
         mqttStatus.subscribed = false;
-        if (currentState == STATE_RUNNING || currentState == STATE_WAIT_PROVISION) {
+        if (currentState == STATE_RUNNING || currentState == STATE_WAIT_PROVISION)
+        {
             nextState(STATE_RECOVER_MQTT);
         }
-    } else if (urc.startsWith("+CMQTTSUB: 0,0")) {
+    }
+    else if (urc.startsWith("+CMQTTSUB: 0,0"))
+    {
         SerialMon.println("Subscription confirmed via URC");
-        if (!mqttStatus.provisionSubscribed && waitingForProvisionResponse) {
+        if (!mqttStatus.provisionSubscribed && waitingForProvisionResponse)
+        {
             mqttStatus.provisionSubscribed = true;
         }
-    } else if (urc.startsWith("+CMQTTRXPAYLOAD: 0,")) {
+    }
+    else if (urc.startsWith("+CMQTTRXPAYLOAD: 0,"))
+    {
         pendingPayloadLen = urc.substring(urc.indexOf(",") + 1).toInt();
         pendingPayload = "";
         receivedPayloadSize = 0;
-    
-    } else if (urc.startsWith("+CMQTTACCQ: 0,0")) {
+    }
+    else if (urc.startsWith("+CMQTTACCQ: 0,0"))
+    {
         SerialMon.println("MQTT client acquisition confirmed via URC");
         mqttStatus.clientAcquired = true;
-    } else if (urc.startsWith("+CMQTTCONNECT: 0,0")) {
+    }
+    else if (urc.startsWith("+CMQTTCONNECT: 0,0"))
+    {
         SerialMon.println("MQTT connection confirmed via URC");
         mqttStatus.connected = true;
         mqttStatus.lastConnectTime = millis();
-        if (currentState == STATE_CONNECT_MQTT) {
-            nextState(STATE_SUBSCRIBE_MQTT); // Proceed if still connecting
+        if (currentState == STATE_CONNECT_MQTT)
+        {
+            nextState(STATE_SUBSCRIBE_MQTT);
         }
-    } else if (urc.startsWith("+CMQTTCONNECT: 0,0")) {
-    SerialMon.println("MQTT connection confirmed via URC");
-    mqttStatus.connected = true;
-    mqttStatus.lastConnectTime = millis();
-    if (currentState == STATE_CONNECT_MQTT) {
-        nextState(STATE_SUBSCRIBE_MQTT);
-    }    
-    } else if (urc.startsWith("+CMQTTRXSTART: 0,")) {
+    }
+    else if (urc.startsWith("+CMQTTRXSTART: 0,"))
+    {
         messageInProgress = true;
         pendingTopic = "";
         pendingPayload = "";
         int commaIdx = urc.indexOf(',', 14);
         pendingTopicLen = urc.substring(14, commaIdx).toInt();
         pendingPayloadLen = urc.substring(commaIdx + 1).toInt();
-    } else if (messageInProgress && !urc.startsWith("+") && pendingTopic == "") {
+    }
+    else if (messageInProgress && !urc.startsWith("+") && pendingTopic == "")
+    {
         pendingTopic = urc;
-    } else if (messageInProgress && !urc.startsWith("+") && pendingTopic != "" && pendingPayload == "") {
+    }
+    else if (messageInProgress && !urc.startsWith("+") && pendingTopic != "" && pendingPayload == "")
+    {
         pendingPayload = urc;
-    } else if (!urc.startsWith("+") && pendingPayloadLen > 0) {
+        receivedPayloadSize = urc.length(); // Initialize size here
+    }
+    else if (!urc.startsWith("+") && pendingPayloadLen > 0)
+    {
         pendingPayload += urc;
-        receivedPayloadSize += urc.length();
+        receivedPayloadSize += urc.length(); // Update size for each chunk
         SerialMon.println("Payload chunk received, total size so far: " + String(receivedPayloadSize));
-    } else if (urc == "+CMQTTRXEND: 0") {
-        if (receivedPayloadSize != pendingPayloadLen) {
+    }
+    else if (urc == "+CMQTTRXEND: 0")
+    {
+        if (receivedPayloadSize != pendingPayloadLen)
+        {
             SerialMon.println("Warning: Received " + String(receivedPayloadSize) + " bytes, expected " + String(pendingPayloadLen));
         }
         handleMessage(pendingTopic, pendingPayload);
@@ -867,6 +1162,7 @@ void processURC(String urc) {
         pendingTopicLen = 0;
         pendingPayloadLen = 0;
         receivedPayloadSize = 0;
+        messageInProgress = false;
     }
 }
 
@@ -900,36 +1196,52 @@ bool setupSSL()
     return modem.waitResponse() == 1;
 }
 
-bool setupMQTT() {
-    if (!mqttStatus.serviceStarted) {
+bool setupMQTT()
+{
+    if (!mqttStatus.serviceStarted)
+    {
         SerialAT.println("AT+CMQTTSTART");
         String response;
-        if (modem.waitResponse(5000L, response) != 1) {
+        if (modem.waitResponse(5000L, response) != 1)
+        {
             response.trim();
             SerialMon.println("MQTT start failed - Response: " + response);
-            if (response.indexOf("+CMQTTSTART:") >= 0) {
+            if (response.indexOf("+CMQTTSTART:") >= 0)
+            {
                 mqttStatus.lastErrorCode = response.substring(response.indexOf(":") + 2).toInt();
-                if (mqttStatus.lastErrorCode == 23) {
+                if (mqttStatus.lastErrorCode == 23)
+                {
                     SerialMon.println("MQTT service already running (+CMQTTSTART: 23), proceeding");
                     mqttStatus.serviceStarted = true;
-                } else {
+                }
+                else
+                {
                     return false;
                 }
-            } else {
+            }
+            else
+            {
                 return false;
             }
-        } else if (response.indexOf("+CMQTTSTART: 0") >= 0) {
+        }
+        else if (response.indexOf("+CMQTTSTART: 0") >= 0)
+        {
             mqttStatus.serviceStarted = true;
             SerialMon.println("MQTT service started successfully");
-        } else {
+        }
+        else
+        {
             SerialMon.println("Unexpected response to AT+CMQTTSTART: " + response);
             return false;
         }
-    } else {
+    }
+    else
+    {
         SerialMon.println("MQTT service already started, skipping AT+CMQTTSTART");
     }
 
-    if (!mqttStatus.clientAcquired) {
+    if (!mqttStatus.clientAcquired)
+    {
         unsigned long timeVal = millis() & 0xFFF;
         clientID = "ESP32_" + String(timeVal);
         SerialMon.println("Generated clientID: " + clientID);
@@ -939,20 +1251,25 @@ bool setupMQTT() {
         SerialMon.println("Sending: " + String(accqCmd));
         SerialAT.println(accqCmd);
 
-        if (modem.waitResponse(5000L) != 1) {
+        if (modem.waitResponse(5000L) != 1)
+        {
             SerialMon.println("Failed to acquire MQTT client - No OK response");
             return false;
         }
         // Assume success if OK is received; URC is optional per SIM7600 manual
         mqttStatus.clientAcquired = true;
         SerialMon.println("MQTT client acquired successfully (OK received)");
-    } else {
+    }
+    else
+    {
         SerialMon.println("MQTT client already acquired, skipping AT+CMQTTACCQ");
     }
 
-    if (!mqttStatus.connected) {
+    if (!mqttStatus.connected)
+    {
         SerialAT.println("AT+CMQTTSSLCFG=0,0");
-        if (modem.waitResponse(2000L) != 1) {
+        if (modem.waitResponse(2000L) != 1)
+        {
             SerialMon.println("Failed to configure SSL for MQTT");
             return false;
         }
@@ -962,21 +1279,26 @@ bool setupMQTT() {
     return true;
 }
 
-bool connectMQTT() {
-    if (mqttStatus.connected) {
+bool connectMQTT()
+{
+    SerialMon.println("Entering connectMQTT - mqttStatus.connected: " + String(mqttStatus.connected));
+    if (mqttStatus.connected)
+    {
         SerialMon.println("MQTT already connected, skipping connect");
         return true;
     }
 
-    if (!mqttStatus.serviceStarted || !mqttStatus.clientAcquired) {
+    if (!mqttStatus.serviceStarted || !mqttStatus.clientAcquired)
+    {
         SerialMon.println("MQTT service or client not ready, setting up...");
-        if (!setupMQTT()) {
+        if (!setupMQTT())
+        {
+            SerialMon.println("setupMQTT failed in connectMQTT");
             return false;
         }
     }
 
     SerialMon.println("Connecting - ClientID: " + clientID + ", User: " + mqtt_user + ", Pass: " + mqtt_pass);
-
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=0,\"tcp://%s:%d\",60,1,\"%s\",\"%s\"",
              mqtt_server, mqtt_port, mqtt_user.c_str(), mqtt_pass.c_str());
@@ -988,56 +1310,77 @@ bool connectMQTT() {
     bool gotOK = false;
     bool gotURC = false;
 
-    // Wait up to 30 seconds, reading directly from SerialAT
-    while (millis() - startTime < 30000L && !gotURC) {
-        if (SerialAT.available()) {
+    while (millis() - startTime < 30000L && !gotURC)
+    {
+        if (SerialAT.available())
+        {
             String line = SerialAT.readStringUntil('\n');
             line.trim();
-            if (line.length() > 0) {
-                SerialMon.println("Received line: " + line + " at " + String(millis() - startTime) + "ms");
+            if (line.length() > 0)
+            {
+                SerialMon.println("Received: " + line + " at " + String(millis() - startTime) + "ms");
                 fullResponse += line + "\n";
-                if (line.indexOf("OK") >= 0) {
+                if (line.indexOf("OK") >= 0)
+                {
                     gotOK = true;
                     SerialMon.println("OK detected");
                 }
-                if (line.indexOf("+CMQTTCONNECT: 0,0") >= 0) {
+                if (line.indexOf("+CMQTTCONNECT: 0,0") >= 0)
+                {
                     gotURC = true;
                     mqttStatus.connected = true;
                     mqttStatus.lastConnectTime = millis();
                     SerialMon.println("MQTT connected successfully");
-                } else if (line.indexOf("+CMQTTCONNECT: 0,") >= 0) {
+                }
+                else if (line.indexOf("+CMQTTCONNECT: 0,") >= 0)
+                {
                     mqttStatus.lastErrorCode = line.substring(line.indexOf(",") + 1).toInt();
                     SerialMon.println("MQTT connection failed - Error code: " + String(mqttStatus.lastErrorCode));
                     return false;
                 }
             }
-        } else {
-            SerialMon.println("No data available at " + String(millis() - startTime) + "ms");
-            delay(100); // Small delay to avoid tight looping
         }
     }
 
-    fullResponse.trim();
-    SerialMon.println("Full response after wait: [" + fullResponse + "]");
-
-    if (gotURC) {
+    SerialMon.println("Full response: [" + fullResponse + "]");
+    if (gotURC)
+    {
+        SerialMon.println("connectMQTT returning true");
         return true;
-    } else if (gotOK) {
-        SerialMon.println("OK received but no success URC within 30s - Assuming failure");
+    }
+    else if (gotOK)
+    {
+        SerialMon.println("OK received but no URC, assuming failure");
         return false;
-    } else {
-        SerialMon.println("No OK or URC received within 30s");
+    }
+    else
+    {
+        SerialMon.println("No OK or URC, connectMQTT failed");
         return false;
     }
 }
 
-bool subscribeMQTT(const char *topic) {
-    if (!topic || strlen(topic) == 0) {
+bool subscribeMQTT()
+{
+    bool success = true;
+    success &= subscribeMQTT(mqtt_topic_recv);
+    success &= subscribeMQTT(mqtt_topic_firmware);
+    success &= subscribeMQTT(PROVISION_RESPONSE_TOPIC);
+    if (success)
+        mqttStatus.subscribed = true;
+    return success;
+}
+
+bool subscribeMQTT(const char *topic)
+{
+    if (!topic || strlen(topic) == 0)
+    {
         SerialMon.println("Invalid topic provided for subscription");
         return false;
     }
 
-    if (!mqttStatus.connected) {
+    if (!mqttStatus.connected)
+    {
         SerialMon.println("MQTT not connected, cannot subscribe to: " + String(topic));
         return false;
     }
@@ -1056,18 +1399,23 @@ bool subscribeMQTT(const char *topic) {
     int waitResult = modem.waitResponse(2000L, response, ">");
     SerialMon.println("waitResponse result: " + String(waitResult) + ", Response: [" + response + "]");
 
-    if (waitResult != 1 || response.indexOf(">") < 0) {
+    if (waitResult != 1 || response.indexOf(">") < 0)
+    {
         response.trim();
         SerialMon.println("Initial wait failed to detect '>' prompt - Response: [" + response + "]");
         // Fallback to raw read
         unsigned long startTime = millis();
-        while (millis() - startTime < 2000L) {
-            if (SerialAT.available()) {
+        while (millis() - startTime < 2000L)
+        {
+            if (SerialAT.available())
+            {
                 String line = SerialAT.readStringUntil('\n');
                 line.trim();
-                if (line.length() > 0) {
+                if (line.length() > 0)
+                {
                     SerialMon.println("Raw read line: " + line + " at " + String(millis() - startTime) + "ms");
-                    if (line.indexOf(">") >= 0) {
+                    if (line.indexOf(">") >= 0)
+                    {
                         SerialMon.println("'>' prompt detected via raw read");
                         response = line;
                         break;
@@ -1076,17 +1424,21 @@ bool subscribeMQTT(const char *topic) {
             }
             delay(100);
         }
-        if (response.indexOf(">") < 0) {
+        if (response.indexOf(">") < 0)
+        {
             SerialMon.println("Failed to get '>' prompt for SUBTOPIC after fallback - Final response: [" + response + "]");
             return false;
         }
-    } else {
+    }
+    else
+    {
         SerialMon.println("'>' prompt received successfully: " + response);
     }
 
     SerialMon.println("Sending topic: " + String(topic));
     SerialAT.print(topic);
-    if (modem.waitResponse(2000L, response) != 1 || response.indexOf("OK") < 0) {
+    if (modem.waitResponse(2000L, response) != 1 || response.indexOf("OK") < 0)
+    {
         SerialMon.println("Failed to send topic - Response: " + response);
         return false;
     }
@@ -1102,27 +1454,36 @@ bool subscribeMQTT(const char *topic) {
     bool gotURC = false;
 
     // Wait up to 10 seconds for OK and URC
-    while (millis() - startTime < 10000L && !gotURC) {
-        if (SerialAT.available()) {
+    while (millis() - startTime < 10000L && !gotURC)
+    {
+        if (SerialAT.available())
+        {
             String line = SerialAT.readStringUntil('\n');
             line.trim();
-            if (line.length() > 0) {
+            if (line.length() > 0)
+            {
                 SerialMon.println("Received line: " + line + " at " + String(millis() - startTime) + "ms");
                 fullResponse += line + "\n";
-                if (line.indexOf("OK") >= 0) {
+                if (line.indexOf("OK") >= 0)
+                {
                     gotOK = true;
                     SerialMon.println("OK detected");
                 }
-                if (line.indexOf("+CMQTTSUB: 0,0") >= 0) {
+                if (line.indexOf("+CMQTTSUB: 0,0") >= 0)
+                {
                     gotURC = true;
                     SerialMon.println("Subscription confirmed for: " + String(topic));
-                } else if (line.indexOf("+CMQTTSUB: 0,") >= 0) {
+                }
+                else if (line.indexOf("+CMQTTSUB: 0,") >= 0)
+                {
                     int errorCode = line.substring(line.indexOf(",") + 1).toInt();
                     SerialMon.println("Subscription failed for " + String(topic) + " - Error code: " + String(errorCode));
                     return false;
                 }
             }
-        } else {
+        }
+        else
+        {
             SerialMon.println("No data available at " + String(millis() - startTime) + "ms");
             delay(100);
         }
@@ -1131,32 +1492,21 @@ bool subscribeMQTT(const char *topic) {
     fullResponse.trim();
     SerialMon.println("Full response after wait: [" + fullResponse + "]");
 
-    if (gotURC) {
+    if (gotURC)
+    {
         SerialMon.println("Successfully subscribed to: " + String(topic));
         return true;
-    } else if (gotOK) {
+    }
+    else if (gotOK)
+    {
         SerialMon.println("OK received but no +CMQTTSUB: 0,0 within 10s for " + String(topic) + " - Assuming failure");
         return false;
-    } else {
+    }
+    else
+    {
         SerialMon.println("No OK or URC received within 10s for " + String(topic));
         return false;
     }
-}
-
-bool subscribeMQTT() {
-    if (mqttStatus.subscribed) {
-        SerialMon.println("Already subscribed to MQTT topics, skipping");
-        return true;
-    }
-
-    bool success = true;
-    success &= subscribeMQTT(mqtt_topic_recv);
-    success &= subscribeMQTT(mqtt_topic_firmware);
-    if (success) {
-        mqttStatus.subscribed = true;
-        SerialMon.println("MQTT subscriptions completed");
-    }
-    return success;
 }
 
 bool publishMQTT(const char *topic, const char *message)
@@ -1239,13 +1589,16 @@ bool disconnectMQTT()
     return success;
 }
 
-bool stopMQTT() {
-    if (!mqttStatus.serviceStarted) {
+bool stopMQTT()
+{
+    if (!mqttStatus.serviceStarted)
+    {
         SerialMon.println("MQTT service already stopped");
         return true;
     }
 
-    if (mqttStatus.connected) {
+    if (mqttStatus.connected)
+    {
         SerialMon.println("Disconnecting MQTT...");
         SerialAT.println("AT+CMQTTDISC=0,120");
 
@@ -1255,23 +1608,30 @@ bool stopMQTT() {
         bool gotURC = false;
 
         // Wait up to 15 seconds for OK or URC
-        while (millis() - startTime < 15000L && !(gotOK && gotURC)) {
-            if (SerialAT.available()) {
+        while (millis() - startTime < 15000L && !(gotOK && gotURC))
+        {
+            if (SerialAT.available())
+            {
                 String line = SerialAT.readStringUntil('\n');
                 line.trim();
-                if (line.length() > 0) {
+                if (line.length() > 0)
+                {
                     SerialMon.println("Received line: " + line + " at " + String(millis() - startTime) + "ms");
                     discResponse += line + "\n";
-                    if (line.indexOf("OK") >= 0) {
+                    if (line.indexOf("OK") >= 0)
+                    {
                         gotOK = true;
                         SerialMon.println("OK detected");
                     }
-                    if (line.indexOf("+CMQTTDISC: 0,0") >= 0) {
+                    if (line.indexOf("+CMQTTDISC: 0,0") >= 0)
+                    {
                         gotURC = true;
                         SerialMon.println("Disconnect confirmed");
                     }
                 }
-            } else {
+            }
+            else
+            {
                 delay(100);
             }
         }
@@ -1279,18 +1639,21 @@ bool stopMQTT() {
         discResponse.trim();
         SerialMon.println("Full disconnect response: [" + discResponse + "]");
 
-        if (!gotURC || !gotOK) {
+        if (!gotURC || !gotOK)
+        {
             SerialMon.println("Warning: Incomplete disconnect response - URC: " + String(gotURC) + ", OK: " + String(gotOK));
         }
         mqttStatus.connected = false; // Assume disconnected even if partial success
-        delay(1000); // Allow modem to process
+        delay(1000);                  // Allow modem to process
     }
 
-    if (mqttStatus.clientAcquired) {
+    if (mqttStatus.clientAcquired)
+    {
         SerialMon.println("Releasing MQTT client...");
         SerialAT.println("AT+CMQTTREL=0");
         String relResponse;
-        if (modem.waitResponse(5000L, relResponse) != 1 || relResponse.indexOf("OK") < 0) {
+        if (modem.waitResponse(5000L, relResponse) != 1 || relResponse.indexOf("OK") < 0)
+        {
             relResponse.trim();
             SerialMon.println("Warning: Failed to release MQTT client - Response: " + relResponse);
         }
@@ -1301,7 +1664,8 @@ bool stopMQTT() {
     SerialMon.println("Stopping MQTT service...");
     SerialAT.println("AT+CMQTTSTOP");
     String stopResponse;
-    if (modem.waitResponse(10000L, stopResponse) != 1 || stopResponse.indexOf("+CMQTTSTOP: 0") < 0) {
+    if (modem.waitResponse(10000L, stopResponse) != 1 || stopResponse.indexOf("+CMQTTSTOP: 0") < 0)
+    {
         stopResponse.trim();
         SerialMon.println("MQTT stop failed - Response: " + stopResponse);
         SerialMon.println("Forcing modem reset due to stop failure...");
@@ -1321,161 +1685,80 @@ void startOTA(uint32_t totalSize)
     updatePartition = esp_ota_get_next_update_partition(NULL);
     if (!updatePartition)
     {
-        SerialMon.println("No valid OTA partition available");
-        publishMQTT(mqtt_topic_send, "OTA:ERROR:No partition");
+        SerialMon.println("No OTA partition");
         return;
     }
     esp_err_t err = esp_ota_begin(updatePartition, totalSize, &otaHandle);
     if (err != ESP_OK)
     {
         SerialMon.printf("OTA begin failed: %s\n", esp_err_to_name(err));
-        publishMQTT(mqtt_topic_send, "OTA:ERROR:Begin failed");
         return;
     }
     otaInProgress = true;
-    pendingValidation = false;
     otaTotalSize = totalSize;
     otaReceivedSize = 0;
     chunkCount = 0;
     receivedChunks.clear();
-    missingChunks.clear();
     mbedtls_sha256_init(&sha256_ctx);
-    mbedtls_sha256_starts(&sha256_ctx, 0); // 0 for SHA256
-    SerialMon.println("OTA started from " + String(previousPartition->label) +
-                      " to " + String(updatePartition->label));
+    mbedtls_sha256_starts(&sha256_ctx, 0);
     publishMQTT(mqtt_topic_send, "OTA:STARTED");
 }
 
 void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen)
 {
-    SerialMon.println("ENTER processOTAFirmware");
-    SerialMon.print("Topic: [");
-    SerialMon.print(topic);
-    SerialMon.print("], Length: ");
-    SerialMon.println(dataLen);
-
-    if (topic != mqtt_topic_firmware)
-    {
-        SerialMon.println("Ignoring OTA message: wrong topic");
-        return;
-    }
-
     String payloadStr((char *)payload, dataLen);
+    SerialMon.println("Processing OTA message: " + payloadStr);
     if (payloadStr.startsWith("OTA:BEGIN:"))
     {
-        if (otaInProgress || pendingValidation)
-        {
-            SerialMon.println("Previous OTA detected, cleaning up...");
+        if (otaInProgress)
             cleanupResources();
-        }
         int colonIdx = payloadStr.indexOf(':', 10);
-        uint32_t totalSize = payloadStr.substring(10, colonIdx).toInt();
-        otaHash = payloadStr.substring(colonIdx + 1);
-        SerialMon.println("Starting OTA with total size: " + String(totalSize) + ", hash: " + otaHash);
-        startOTA(totalSize);
-        publishMQTT(mqtt_topic_send, "OTA:STARTED");
+        otaTotalSize = payloadStr.substring(10, colonIdx).toInt();
+        int nextColon = payloadStr.indexOf(':', colonIdx + 1);
+        otaHash = payloadStr.substring(colonIdx + 1, nextColon);
+        otaSignature = payloadStr.substring(nextColon + 1); // Store the signature
+        SerialMon.println("OTA Begin - Size: " + String(otaTotalSize) + ", Hash: " + otaHash + ", Signature: " + otaSignature);
+        startOTA(otaTotalSize);
         return;
     }
-
     if (!otaInProgress)
     {
-        SerialMon.println("Ignoring OTA message: OTA not started");
+        SerialMon.println("Ignoring OTA message: OTA not in progress");
         return;
     }
-
-    if (pendingValidation)
-    {
-        SerialMon.println("Ignoring OTA message: OTA pending validation");
-        return;
-    }
-
     if (payloadStr == "OTA:END")
     {
         SerialMon.println("Received OTA:END");
         finishOTA();
         return;
     }
-    if (payloadStr == "OTA:CANCEL")
-    {
-        if (otaInProgress)
-        {
-            SerialMon.println("Cancelling ongoing OTA update");
-            cleanupResources(); // Reset OTA state, free resources
-            publishMQTT(mqtt_topic_firmware, "OTA:CANCELLED");
-        }
-        else
-        {
-            SerialMon.println("No OTA in progress to cancel");
-        }
-        return;
-    }
-    // Decode base64 chunk
     size_t maxDecodedLen = ((dataLen + 3) / 4) * 3;
     unsigned char *decodedPayload = new unsigned char[maxDecodedLen];
     size_t decodedLen = base64_decode((char *)payload, decodedPayload, maxDecodedLen);
     if (decodedLen < 4)
     {
-        SerialMon.println("Invalid decoded chunk size: " + String(decodedLen) + ", raw payload: " + payloadStr.substring(0, 50));
+        SerialMon.println("Invalid chunk size: " + String(decodedLen));
         delete[] decodedPayload;
         return;
     }
-
     unsigned long chunkNum = ((unsigned long)decodedPayload[0] << 24) |
                              ((unsigned long)decodedPayload[1] << 16) |
                              ((unsigned long)decodedPayload[2] << 8) |
                              decodedPayload[3];
     size_t chunkSize = decodedLen - 4;
-
-    if (chunkSize > OTA_MAX_DATA_SIZE)
-    {
-        SerialMon.println("Chunk too large: " + String(chunkSize) + " for chunk " + String(chunkNum));
-        delete[] decodedPayload;
-        return;
-    }
-
     if (receivedChunks[chunkNum])
     {
-        SerialMon.println("Duplicate chunk " + String(chunkNum));
+        SerialMon.println("Duplicate chunk: " + String(chunkNum));
         delete[] decodedPayload;
         return;
     }
-
-    esp_err_t err = esp_ota_write(otaHandle, decodedPayload + 4, chunkSize);
-    if (err != ESP_OK)
-    {
-        SerialMon.printf("OTA write failed for chunk %lu: %s\n", chunkNum, esp_err_to_name(err));
-        cleanupResources();
-        publishMQTT(mqtt_topic_send, "OTA:ERROR:Write failed");
-        delete[] decodedPayload;
-        return;
-    }
-
+    esp_ota_write(otaHandle, decodedPayload + 4, chunkSize);
     mbedtls_sha256_update(&sha256_ctx, decodedPayload + 4, chunkSize);
     receivedChunks[chunkNum] = true;
     otaReceivedSize += chunkSize;
     chunkCount++;
-    SerialMon.println("Processed chunk " + String(chunkNum) + ", size=" + String(chunkSize));
-
-    // Send acknowledgment for every chunk
-    // String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize);
-    // if (publishMQTT(mqtt_topic_send, ackMsg.c_str()))
-    // {
-    //     SerialMon.println("Sent acknowledgment: " + ackMsg);
-    // }
-    // else
-    // {
-    //     SerialMon.println("Failed to send acknowledgment: " + ackMsg);
-    // }
-
-    static int chunksSinceAck = 0;
-    chunksSinceAck++;
-    if (chunksSinceAck >= BATCH_SIZE)
-    { // Acknowledge every 5 chunks
-        String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize);
-        publishMQTT(mqtt_topic_firmware, ackMsg.c_str());
-        chunksSinceAck = 0;
-    }
-
+    String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize) + ":DEVICE:" + clientID;
+    publishMQTT(mqtt_topic_send, ackMsg.c_str());
     delete[] decodedPayload;
 }
 
@@ -1486,30 +1769,16 @@ void finishOTA()
         SerialMon.println("No OTA in progress to finish");
         return;
     }
-
-    // Retry missing chunks up to 3 times
-    const int MAX_CHUNK_RETRIES = 3;
-    int retryCount = 0;
-    while (retryCount < MAX_CHUNK_RETRIES)
-    {
-        checkMissingChunks();
-        if (otaReceivedSize == otaTotalSize)
-        {
-            break; // All chunks received
-        }
-        SerialMon.println("Missing chunks detected, retry " + String(retryCount + 1) + "/" + String(MAX_CHUNK_RETRIES));
-        delay(5000); // Wait for server to resend
-        retryCount++;
-    }
-
     if (otaReceivedSize != otaTotalSize)
     {
-        SerialMon.println("OTA incomplete: Received " + String(otaReceivedSize) + "/" + String(otaTotalSize));
+        SerialMon.println("OTA incomplete: Received " + String(otaReceivedSize) + " of " + String(otaTotalSize));
+        checkMissingChunks();
         cleanupResources();
         publishMQTT(mqtt_topic_send, "OTA:ERROR:Incomplete");
         return;
     }
 
+    // Compute SHA-256 hash
     unsigned char hash[32];
     mbedtls_sha256_finish(&sha256_ctx, hash);
     mbedtls_sha256_free(&sha256_ctx);
@@ -1520,15 +1789,30 @@ void finishOTA()
         sprintf(hex, "%02x", hash[i]);
         computedHash += hex;
     }
+    SerialMon.println("Computed Hash: " + computedHash + ", Expected Hash: " + otaHash);
+
+    // Verify hash
     if (computedHash != otaHash)
     {
-        SerialMon.println("Hash mismatch: " + computedHash + " vs " + otaHash);
+        SerialMon.println("Hash mismatch detected");
         cleanupResources();
         publishMQTT(mqtt_topic_send, "OTA:ERROR:Hash mismatch");
-        publishMQTT(mqtt_topic_send, "OTA:REQUEST:RETRY"); // Request retry
         return;
     }
 
+    // Verify ECDSA signature
+    unsigned char signature[128]; // Buffer large enough for base64-decoded signature
+    size_t sig_len = base64_decode(otaSignature.c_str(), signature, 128);
+    if (sig_len == 0 || !verifyOTASignature(hash, 32, signature, sig_len))
+    {
+        SerialMon.println("OTA signature verification failed");
+        cleanupResources();
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Signature invalid");
+        return;
+    }
+    SerialMon.println("OTA signature verified successfully");
+
+    // Apply the update
     esp_err_t err = esp_ota_end(otaHandle);
     if (err != ESP_OK)
     {
@@ -1537,26 +1821,24 @@ void finishOTA()
         publishMQTT(mqtt_topic_send, "OTA:ERROR:End failed");
         return;
     }
-    SerialMon.println("OTA update written, validating...");
-    publishMQTT(mqtt_topic_send, "OTA:SUCCESS:PENDING_VALIDATION");
-    pendingValidation = true; // Set flag
-    delay(10000);             // Wait for server confirmation
     err = esp_ota_set_boot_partition(updatePartition);
     if (err != ESP_OK)
     {
         SerialMon.printf("OTA set boot partition failed: %s\n", esp_err_to_name(err));
-        publishMQTT(mqtt_topic_firmware, "OTA:ERROR:Set boot failed");
+        cleanupResources();
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Boot partition set failed");
         return;
     }
+
     SerialMon.println("OTA successful, restarting...");
-    delay(1000);
     otaInProgress = false;
+    publishMQTT(mqtt_topic_send, "OTA:SUCCESS:PENDING_VALIDATION");
+    delay(1000); // Brief delay to ensure message is sent
     ESP.restart();
 }
 
 void checkMissingChunks()
 {
-    SerialMon.println("Checking for missing chunks...");
     unsigned long expectedChunks = (otaTotalSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
     String missingMsg = "OTA:REQUEST:";
     bool hasMissing = false;
@@ -1570,73 +1852,30 @@ void checkMissingChunks()
     }
     if (hasMissing)
     {
-        missingMsg.remove(missingMsg.length() - 1); // Remove trailing comma
-        SerialMon.println("Requesting missing chunks: " + missingMsg);
+        missingMsg.remove(missingMsg.length() - 1);
         publishMQTT(mqtt_topic_send, missingMsg.c_str());
-    }
-    else
-    {
-        SerialMon.println("No missing chunks detected");
     }
 }
 
 void revertToPreviousFirmware()
 {
-    if (previousPartition == NULL)
-    {
-        SerialMon.println("No previous partition known");
-        publishMQTT(mqtt_topic_send, "REVERT:ERROR:No previous partition");
+    if (!previousPartition)
         return;
-    }
-    const esp_partition_t *current = esp_ota_get_running_partition();
-    if (current == previousPartition)
-    {
-        SerialMon.println("Already running previous firmware");
-        publishMQTT(mqtt_topic_send, "REVERT:ERROR:Already on previous");
-        return;
-    }
-    esp_err_t err = esp_ota_set_boot_partition(previousPartition);
-    if (err != ESP_OK)
-    {
-        SerialMon.printf("Failed to set boot partition: %s\n", esp_err_to_name(err));
-        publishMQTT(mqtt_topic_send, "REVERT:ERROR:Set failed");
-        return;
-    }
-    SerialMon.println("Reverting to previous firmware: " + String(previousPartition->label));
-    String revertMsg = String("REVERT:SUCCESS:") + String(previousPartition->label);
-    publishMQTT(mqtt_topic_send, revertMsg.c_str());
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Reverting...");
-    }
-#endif
-    pendingValidation = false;
-    delay(1000);
+    esp_ota_set_boot_partition(previousPartition);
+    SerialMon.println("Reverting to previous firmware");
     ESP.restart();
 }
 
 void performFactoryReset()
 {
-    const esp_partition_t *factoryPartition = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-                                                                       ESP_PARTITION_SUBTYPE_APP_FACTORY,
-                                                                       NULL);
-    if (factoryPartition == NULL)
+    const esp_partition_t *factoryPartition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (!factoryPartition)
     {
-        SerialMon.println("Factory partition not found");
-        publishMQTT(mqtt_topic_send, "FACTORY_RESET:ERROR:No factory partition");
+        SerialMon.println("No factory partition found");
         return;
     }
 
-    esp_err_t err = esp_ota_set_boot_partition(factoryPartition);
-    if (err != ESP_OK)
-    {
-        SerialMon.printf("Failed to set factory partition: %s\n", esp_err_to_name(err));
-        publishMQTT(mqtt_topic_send, "FACTORY_RESET:ERROR:Set failed");
-        return;
-    }
-
+    esp_ota_set_boot_partition(factoryPartition);
     preferences.begin("device-creds", false);
     preferences.clear();
     preferences.end();
@@ -1644,221 +1883,270 @@ void performFactoryReset()
     clientID = DEFAULT_CLIENT_ID;
     mqtt_user = DEFAULT_USERNAME;
     mqtt_pass = DEFAULT_PASSWORD;
-
-    SerialMon.println("Factory reset complete");
-    publishMQTT(mqtt_topic_send, "FACTORY_RESET:SUCCESS");
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Factory Reset");
-    }
-#endif
-    delay(1000);
     ESP.restart();
 }
 
-// Check running partition
-void check_firmware_partition()
-{
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    if (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY)
-    {
-        SerialMon.println("Running from factory partition");
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("Factory Mode");
-        }
-#endif
-    }
-    else if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ||
-             running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
-    {
-        SerialMon.printf("Running from OTA partition %d\n", running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0);
-#ifdef ENABLE_LCD
-        if (lcdAvailable)
-        {
-            lcd.clear();
-            lcd.print("OTA Mode");
-        }
-#endif
-    }
-}
-
-void resetCredentials()
-{
-    preferences.begin("device-creds", false); // Open in read-write mode
-    preferences.clear();                      // Clear all key-value pairs in "device-creds"
-    preferences.end();
-
-    // Reset global variables to defaults
-    isProvisioned = false;
-    clientID = DEFAULT_CLIENT_ID;
-    mqtt_user = DEFAULT_USERNAME;
-    mqtt_pass = DEFAULT_PASSWORD;
-
-    SerialMon.println("Credentials reset to defaults");
-#ifdef ENABLE_LCD
-    if (lcdAvailable)
-    {
-        lcd.clear();
-        lcd.print("Creds Reset");
-    }
-#endif
-}
-
-// Load credentials from NVS
 void loadCredentials()
 {
     preferences.begin("device-creds", true);
     isProvisioned = preferences.getBool("provisioned", false);
-
     if (isProvisioned)
     {
-        clientID = preferences.getString("client_id", "GESUS_" + String(millis()));
-        mqtt_user = preferences.getString("username", "ESP32_" + imei);
-        mqtt_pass = preferences.getString("password", "");
-        if (mqtt_pass == "")
-        {
-            SerialMon.println("Warning: No saved password found, resetting to default");
-            isProvisioned = false;
-            clientID = DEFAULT_CLIENT_ID;
-            mqtt_user = DEFAULT_USERNAME;
-            mqtt_pass = DEFAULT_PASSWORD;
-        }
+        clientID = preferences.getString("device_id", DEFAULT_CLIENT_ID); // Load custom device ID
+        unsigned char enc_user[32], dec_user[32];
+        unsigned char enc_pass[32], dec_pass[32];
+        preferences.getBytes("username", enc_user, 32);
+        preferences.getBytes("password", enc_pass, 32);
+        decryptNVSData(enc_user, 32, dec_user);
+        decryptNVSData(enc_pass, 32, dec_pass);
+        mqtt_user = String((char *)dec_user);
+        mqtt_pass = String((char *)dec_pass);
     }
     else
     {
-        // clientID = "GESUS_" + String(millis());
-        // mqtt_user = "ESP32_" + imei;
-        // mqtt_pass = DEFAULT_PASSWORD;
         clientID = DEFAULT_CLIENT_ID;
         mqtt_user = DEFAULT_USERNAME;
         mqtt_pass = DEFAULT_PASSWORD;
     }
-
-    mqtt_user.replace("\r", "");
-    mqtt_user.replace("\n", "");
-    int okIndex = mqtt_user.indexOf("OK");
-    if (okIndex != -1)
-    {
-        mqtt_user = mqtt_user.substring(0, okIndex);
-    }
-    mqtt_user.trim();
-    mqtt_pass.replace("\r", "");
-    mqtt_pass.replace("\n", "");
-    mqtt_pass.trim();
-
     preferences.end();
-    SerialMon.println("Loaded credentials:");
-    SerialMon.println("Client ID: " + clientID);
-    SerialMon.println("Username: " + mqtt_user);
-    SerialMon.println("Provisioned: " + String(isProvisioned ? "Yes" : "No"));
 }
 
-// Save credentials to NVS
-void saveCredentials(String newPassword)
+void saveCredentials(String device_id, String username, String password)
 {
-    if (imei == "" || imei == "Unknown")
-    {
-        SerialMon.println("Cannot save credentials without valid IMEI");
-        return;
-    }
-
-    mqtt_user = "ESP32_" + imei;
-    mqtt_user.replace("\r", "");
-    mqtt_user.replace("\n", "");
-    int okIndex = mqtt_user.indexOf("OK");
-    if (okIndex != -1)
-    {
-        mqtt_user = mqtt_user.substring(0, okIndex);
-    }
-    mqtt_user.trim();
-
-    if (!isProvisioned)
-    {
-        clientID = "GESUS_" + String(millis());
-    }
-    mqtt_pass = newPassword;
-    mqtt_pass.replace("\r", "");
-    mqtt_pass.replace("\n", "");
-    mqtt_pass.trim();
+    clientID = device_id; // Use server-assigned ID as MQTT client ID
+    mqtt_user = username;
+    mqtt_pass = password;
 
     preferences.begin("device-creds", false);
-    preferences.putString("client_id", clientID);
-    preferences.putString("username", mqtt_user);
-    preferences.putString("password", mqtt_pass);
+    preferences.putString("device_id", device_id); // Store the custom device ID
+
+    unsigned char enc_user[32], dec_user[32];
+    memset(dec_user, 0, 32);
+    memcpy(dec_user, mqtt_user.c_str(), min(mqtt_user.length(), (size_t)32));
+    encryptNVSData(dec_user, 32, enc_user);
+    preferences.putBytes("username", enc_user, 32);
+
+    unsigned char enc_pass[32], dec_pass[32];
+    memset(dec_pass, 0, 32);
+    memcpy(dec_pass, mqtt_pass.c_str(), min(mqtt_pass.length(), (size_t)32));
+    encryptNVSData(dec_pass, 32, enc_pass);
+    preferences.putBytes("password", enc_pass, 32);
+
     preferences.putBool("provisioned", true);
     preferences.end();
-
     isProvisioned = true;
-    SerialMon.println("Saved new credentials:");
-    SerialMon.println("Client ID: " + clientID);
-    SerialMon.println("Username: " + mqtt_user);
-    SerialMon.println("Password length: " + String(mqtt_pass.length()));
 }
 
-bool republishProvisionRequest()
+bool requestCredentialsFromServer()
 {
-    if (!mqttStatus.serviceStarted || !mqttStatus.provisionSubscribed)
+    preferences.begin("device-creds", false);
+    bool hasPendingNonce = preferences.isKey("nonce");
+
+    if (hasPendingNonce && waitingForProvisionResponse)
     {
-        SerialMon.println("Cannot republish: MQTT not fully set up");
+        // Reuse existing nonce and keys
+        unsigned char nonce[16];
+        unsigned char priv_key[32];
+        preferences.getBytes("nonce", nonce, 16);
+        preferences.getBytes("ecdh_priv", priv_key, 32);
+        String nonceStr = base64_encode(nonce, 16);
+
+        // Load public key from stored private key
+        mbedtls_ecdh_context ecdh;
+        mbedtls_ctr_drbg_context ctr_drbg;
+        mbedtls_entropy_context entropy;
+        mbedtls_ecdh_init(&ecdh);
+        mbedtls_ctr_drbg_init(&ctr_drbg);
+        mbedtls_entropy_init(&entropy);
+
+        if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0) != 0)
+        {
+            SerialMon.println("Failed to seed DRBG");
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return false;
+        }
+
+        if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+        {
+            SerialMon.println("Failed to load curve");
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return false;
+        }
+
+        if (mbedtls_mpi_read_binary(&ecdh.d, priv_key, 32) != 0)
+        {
+            SerialMon.println("Failed to load private key from NVS");
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return false;
+        }
+
+        // Generate public key into a buffer
+        unsigned char pubkey_buf[65]; // 0x04 + 32 bytes X + 32 bytes Y
+        size_t olen;
+        if (mbedtls_ecdh_make_public(&ecdh, &olen, pubkey_buf, sizeof(pubkey_buf),
+                                     mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
+        {
+            SerialMon.println("Failed to regenerate public key from stored private key");
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return false;
+        }
+
+        // Ensure the output is in uncompressed format (0x04 prefix)
+        if (olen != 65 || pubkey_buf[0] != 0x04)
+        {
+            SerialMon.println("Invalid public key format");
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return false;
+        }
+
+        String pubkey_b64 = base64_encode(pubkey_buf, 65);
+
+        String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
+        if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
+        {
+            SerialMon.println("Resent provision request with stored nonce");
+            lastRequestTime = millis();
+            mbedtls_entropy_free(&entropy);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_ecdh_free(&ecdh);
+            preferences.end();
+            return true;
+        }
+
+        SerialMon.println("Failed to resend provision request");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
         return false;
     }
 
-    String requestMsg = "IMEI:" + imei;
+    // Generate new nonce and keys if no pending request
+    mbedtls_ecdh_context ecdh;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+
+    mbedtls_ecdh_init(&ecdh);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+
+    if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0) != 0)
+    {
+        SerialMon.println("Failed to seed DRBG");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+
+    if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+    {
+        SerialMon.println("Failed to load curve");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+
+    if (mbedtls_ecdh_gen_public(&ecdh.grp, &ecdh.d, &ecdh.Q, mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
+    {
+        SerialMon.println("Failed to generate public key");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+
+    if (mbedtls_ecp_check_privkey(&ecdh.grp, &ecdh.d) != 0)
+    {
+        SerialMon.println("Generated private key is invalid");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+
+    unsigned char pubkey[65];
+    pubkey[0] = 0x04;
+    if (mbedtls_mpi_write_binary(&ecdh.Q.X, pubkey + 1, 32) != 0 ||
+        mbedtls_mpi_write_binary(&ecdh.Q.Y, pubkey + 33, 32) != 0)
+    {
+        SerialMon.println("Failed to serialize public key");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+    String pubkey_b64 = base64_encode(pubkey, 65);
+
+    unsigned char priv_key[32];
+    if (mbedtls_mpi_write_binary(&ecdh.d, priv_key, 32) != 0)
+    {
+        SerialMon.println("Failed to serialize private key");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
+        preferences.end();
+        return false;
+    }
+    SerialMon.print("Storing private key: ");
+    for (int i = 0; i < 32; i++)
+        SerialMon.printf("%02x", priv_key[i]);
+    SerialMon.println();
+
+    unsigned char nonce[16];
+    esp_fill_random(nonce, 16);
+    String nonceStr = base64_encode(nonce, 16);
+
+    String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
+
     if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
     {
-        SerialMon.println("Republished credentials request with IMEI: " + imei);
-        lastRequestTime = millis();
-        return true;
-    }
-    else
-    {
-        SerialMon.println("Failed to republish provisioning request");
-        return false;
-    }
-}
-
-// Request credentials from server
-bool requestCredentialsFromServer() {
-    if (imei == "" || imei == "Unknown") {
-        SerialMon.println("No IMEI available for provisioning");
-        return false;
-    }
-
-    mqtt_user = DEFAULT_USERNAME;
-    mqtt_pass = DEFAULT_PASSWORD;
-
-    if (!mqttStatus.serviceStarted || !mqttStatus.clientAcquired) {
-        if (!setupMQTT()) {
-            return false;
-        }
-    }
-    if (!mqttStatus.connected) {
-        if (!connectMQTT()) {
-            return false;
-        }
-    }
-    if (!mqttStatus.provisionSubscribed) {
-        if (subscribeMQTT(PROVISION_RESPONSE_TOPIC)) {
-            mqttStatus.provisionSubscribed = true;
-        } else {
-            return false;
-        }
-    }
-
-    String requestMsg = "IMEI:" + imei;
-    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str())) {
-        SerialMon.println("Credentials request sent with IMEI: " + imei);
         waitingForProvisionResponse = true;
         provisionStartTime = millis();
         lastRequestTime = millis();
+        preferences.putBytes("ecdh_priv", priv_key, 32);
+        preferences.putBytes("nonce", nonce, 16);
+        preferences.end();
+        SerialMon.println("Private key and nonce stored in NVS");
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_ecdh_free(&ecdh);
         return true;
     }
+
+    SerialMon.println("Failed to request credentials");
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_ecdh_free(&ecdh);
+    preferences.end();
     return false;
 }
 
+/*
 
+
+provisioning okay
+
+
+*/
