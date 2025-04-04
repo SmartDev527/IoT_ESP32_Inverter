@@ -35,7 +35,8 @@ CHUNK_SIZE = 1024
 KEY_FILE = "server_private_key.pem"
 if os.path.exists(KEY_FILE):
     with open(KEY_FILE, "rb") as f:
-        PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+        PRIVATE_KEY = serialization.load_pem_private_key(
+            f.read(), password=None, backend=default_backend())
 else:
     PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1(), default_backend())
     pem = PRIVATE_KEY.private_bytes(
@@ -59,8 +60,7 @@ chunk_ack_event = threading.Event()
 last_chunk_sent = -1
 chunk_buffer = {}
 ota_in_progress = False
-
-
+acknowledged_chunks = set()  # Reverted to a single set, no device-specific tracking
 
 def load_devices():
     try:
@@ -72,7 +72,6 @@ def load_devices():
 def save_devices(devices):
     with open("devices.json", "w") as f:
         json.dump(devices, f, indent=4)
-
 
 def pad(data, block_size=16):
     padding_len = block_size - (len(data) % block_size)
@@ -115,7 +114,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         print(f"Connection failed with code {rc}")
 
 def on_message(client, userdata, msg):
-    global last_chunk_sent, ota_in_progress
+    global last_chunk_sent, ota_in_progress, chunk_ack_event, acknowledged_chunks
     payload = msg.payload.decode('utf-8')
     topic = msg.topic
     print(f"Received - Topic: {topic}, Payload: {payload[:50]}...")
@@ -138,6 +137,8 @@ def on_message(client, userdata, msg):
                 total_size = int(sizes[1])
                 device_id = parts[5]
                 print(f"Progress for {device_id}: {received_size}/{total_size} bytes, chunk: {chunk_num}")
+                acknowledged_chunks.add(chunk_num)
+                print(f"Added chunk {chunk_num}, current count: {len(acknowledged_chunks)}")
                 if ota_in_progress and chunk_num == last_chunk_sent:
                     chunk_ack_event.set()
         elif payload == "OTA:STARTED":
@@ -162,108 +163,124 @@ def on_message(client, userdata, msg):
         elif payload == "OTA:SUCCESS:PENDING_VALIDATION":
             print("OTA completed, pending validation")
             ota_in_progress = False
+            chunk_ack_event.set()
         elif payload == "OTA:CANCELLED":
             print("OTA cancelled")
             ota_in_progress = False
             chunk_ack_event.set()
 
 def send_ota_firmware(file_path):
-    global last_chunk_sent, chunk_buffer, ota_in_progress
-    MAX_RETRIES = 5  # Maximum number of retries for BEGIN and each chunk
-    RETRY_DELAY = 5  # Seconds to wait between retries
-    BEGIN_TIMEOUT = 10  # Initial timeout for OTA:STARTED
-    
+    global last_chunk_sent, chunk_buffer, ota_in_progress, acknowledged_chunks
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
+    FINAL_CONFIRMATION_TIMEOUT = 20
+
     try:
         if not os.path.exists(file_path):
             print(f"Error: File '{file_path}' not found")
             return
-        
+
         file_size = os.path.getsize(file_path)
         print(f"File size: {file_size} bytes")
-        
+        total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
         with open(file_path, "rb") as f:
             magic_byte = f.read(1)
             print(f"Magic byte: {magic_byte}")
             if magic_byte != b'\xe9':
                 print("Error: Invalid firmware file (magic byte != 0xE9)")
                 return
-            
+
             firmware_hash = compute_firmware_hash(file_path)
             signature = sign_firmware(file_path)
             begin_command = f"OTA:BEGIN:{file_size}:{firmware_hash}:{signature}"
-            
-            # Retry sending OTA:BEGIN until OTA:STARTED is received
-            retries = 0
-            while retries < MAX_RETRIES and ota_in_progress:
+
+            for attempt in range(MAX_RETRIES):
                 client.publish(OTA_TOPIC, begin_command, qos=1)
-                print(f"Sent: {begin_command} (attempt {retries + 1}/{MAX_RETRIES})")
-                
+                print(f"Sent: {begin_command} (attempt {attempt + 1}/{MAX_RETRIES})")
                 chunk_ack_event.clear()
                 ota_in_progress = True
-                if chunk_ack_event.wait(timeout=BEGIN_TIMEOUT):
-                    print("Received OTA:STARTED, proceeding to send chunks")
+                if chunk_ack_event.wait(timeout=10):
+                    print("OTA:STARTED received, proceeding with chunks")
                     break
-                else:
-                    retries += 1
-                    print(f"Timeout waiting for OTA:STARTED, retrying...")
-                    if retries < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY)
-                    else:
-                        print(f"Max retries reached for OTA:BEGIN, aborting OTA")
-                        ota_in_progress = False
-                        client.publish(OTA_TOPIC, "OTA:CANCELLED", qos=1)
-                        return
-            
-            f.seek(0)  # Reset file pointer to start
+                elif attempt == MAX_RETRIES - 1:
+                    print("Max retries reached for OTA:BEGIN, aborting")
+                    ota_in_progress = False
+                    return
+                time.sleep(RETRY_DELAY)
+
+            f.seek(0)
             chunk_num = 0
             total_bytes_sent = 0
             chunk_buffer.clear()
-            
+            acknowledged_chunks.clear()  # Reset for this OTA session
+
             print("Starting chunk transmission...")
             while total_bytes_sent < file_size and ota_in_progress:
-                chunk = f.read(CHUNK_SIZE)
+                remaining_bytes = file_size - total_bytes_sent
+                chunk_size = min(CHUNK_SIZE, remaining_bytes)
+                chunk = f.read(chunk_size)
                 if not chunk:
                     print(f"End of file reached unexpectedly at {total_bytes_sent} bytes")
                     break
+
                 if len(chunk) < CHUNK_SIZE and total_bytes_sent + len(chunk) < file_size:
                     chunk += b'\x00' * (CHUNK_SIZE - len(chunk))
+
                 chunk_data = chunk_num.to_bytes(4, byteorder='big') + chunk
                 encoded_chunk = base64.b64encode(chunk_data).decode('utf-8')
                 chunk_buffer[chunk_num] = encoded_chunk
-                
-                retries = 0
-                while retries < MAX_RETRIES and ota_in_progress:
+
+                for attempt in range(MAX_RETRIES):
                     client.publish(OTA_TOPIC, encoded_chunk, qos=1)
-                    print(f"Sent chunk {chunk_num} ({len(chunk)} bytes, attempt {retries + 1}/{MAX_RETRIES})")
-                    
+                    print(f"Sent chunk {chunk_num} ({len(chunk)} bytes, attempt {attempt + 1}/{MAX_RETRIES})")
                     total_bytes_sent += len(chunk)
                     last_chunk_sent = chunk_num
-                    
                     chunk_ack_event.clear()
                     if chunk_ack_event.wait(timeout=20):
                         break
-                    else:
-                        retries += 1
-                        print(f"Timeout waiting for chunk {chunk_num} ack, retrying...")
-                        if retries < MAX_RETRIES:
-                            time.sleep(RETRY_DELAY)
-                        else:
-                            print(f"Max retries reached for chunk {chunk_num}, aborting OTA")
-                            ota_in_progress = False
-                            client.publish(OTA_TOPIC, "OTA:CANCELLED", qos=1)
-                            return
-                
+                    elif attempt == MAX_RETRIES - 1:
+                        print(f"Max retries reached for chunk {chunk_num}, aborting")
+                        ota_in_progress = False
+                        client.publish(OTA_TOPIC, "OTA:CANCELLED", qos=1)
+                        return
+                    time.sleep(RETRY_DELAY)
+
                 chunk_num += 1
-            
+
             if total_bytes_sent != file_size:
                 print(f"Error: Sent {total_bytes_sent} bytes, expected {file_size}")
                 ota_in_progress = False
                 return
-            
+
             if ota_in_progress:
-                client.publish(OTA_TOPIC, "OTA:END", qos=1)
-                print("Sent: OTA:END")
-                ota_in_progress = False
+                print(f"All {chunk_num} chunks sent, waiting for ESP32 confirmation...")
+                while ota_in_progress and len(acknowledged_chunks) < total_chunks:
+                    chunk_ack_event.clear()
+                    print(f"Current acknowledged chunks: {len(acknowledged_chunks)}/{total_chunks}")
+                    if not chunk_ack_event.wait(timeout=FINAL_CONFIRMATION_TIMEOUT):
+                        print(f"Timeout waiting for acknowledgment, {len(acknowledged_chunks)}/{total_chunks} chunks confirmed")
+                        time.sleep(5)
+                        if not ota_in_progress:
+                            print("OTA aborted due to errors or cancellation")
+                            return
+                    else:
+                        print(f"Ack event set, acknowledged chunks: {len(acknowledged_chunks)}/{total_chunks}")
+
+                if ota_in_progress and len(acknowledged_chunks) == total_chunks:
+                    client.publish(OTA_TOPIC, "OTA:END", qos=1)
+                    print("Sent: OTA:END")
+                elif ota_in_progress:
+                    print("All chunks acknowledged but OTA still in progress, waiting for final status...")
+                    chunk_ack_event.clear()
+                    if chunk_ack_event.wait(timeout=FINAL_CONFIRMATION_TIMEOUT):
+                        client.publish(OTA_TOPIC, "OTA:END", qos=1)
+                        print("Sent: OTA:END after final status")
+                    else:
+                        print("Final status timeout, assuming success if no errors")
+                        client.publish(OTA_TOPIC, "OTA:END", qos=1)
+                        print("Sent: OTA:END after timeout")
+
     except Exception as e:
         print(f"Error during OTA: {e}")
         ota_in_progress = False
@@ -274,6 +291,7 @@ def input_handler():
     devices = load_devices()
 
     while True:
+        # Process provisioning requests first
         if not command_queue.empty():
             cmd_type, data = command_queue.get()
             if cmd_type == "provision":
@@ -284,11 +302,9 @@ def input_handler():
                     print(f"Invalid public key format: {len(client_pubkey_bytes)} bytes, first byte: {client_pubkey_bytes[0]}")
                     command_queue.task_done()
                     continue
-                der_prefix = bytes.fromhex(
-                    "3059301306072a8648ce3d020106082a8648ce3d030107034200"
-                )
+                der_prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
                 der_pubkey = der_prefix + client_pubkey_bytes
-                
+
                 try:
                     client_pubkey = serialization.load_der_public_key(der_pubkey, default_backend())
                 except ValueError as e:
@@ -297,14 +313,16 @@ def input_handler():
                     continue
                 shared_secret = PRIVATE_KEY.exchange(ec.ECDH(), client_pubkey)
                 derived_key = sha256(shared_secret).digest()
-                
-                # Use IMEI as device ID and prefix username with "ESP32_"
+
                 device_id = imei
                 username = f"ESP32_{imei}"
                 devices[device_id] = {"imei": imei, "status": "provisioned"}
                 save_devices(devices)
 
-                password = input(f"Provide password for {device_id} (min 12 chars): ").strip()
+                # Fix password prompt by ensuring immediate display
+                sys.stdout.write(f"Provide password for {device_id} (min 12 chars): ")
+                sys.stdout.flush()
+                password = input().strip()
                 if password and len(password) >= 12:
                     creds = f"DEVICE_ID:{device_id}:USERNAME:{username}:PASSWORD:{password}"
                     iv = base64.b64decode(nonce)
@@ -314,9 +332,11 @@ def input_handler():
                     print(f"Sent encrypted credentials for {device_id}")
                     print(f"Payload of Credentials: {response}")
                 else:
-                    print("Password too short")
+                    print("Password too short or invalid")
                 command_queue.task_done()
-        
+                continue  # Ensure loop continues after provisioning
+
+        # Handle user commands
         if platform.system() == "Windows":
             if msvcrt.kbhit():
                 char = msvcrt.getch().decode('utf-8')
@@ -327,7 +347,7 @@ def input_handler():
                         if command == "ota":
                             file_path = input("Enter firmware file path: ").strip()
                             if os.path.exists(file_path):
-                                send_ota_firmware(file_path)
+                                send_ota_firmware(file_path)  # No device_id prompt
                         elif command == "reverse old firmware":
                             client.publish(OTA_TOPIC, "reverse old firmware", qos=1)
                             print("Sent: reverse old firmware")
@@ -346,7 +366,7 @@ def input_handler():
                         if command == "ota":
                             file_path = input("Enter firmware file path: ").strip()
                             if os.path.exists(file_path):
-                                send_ota_firmware(file_path)
+                                send_ota_firmware(file_path)  # No device_id prompt
                         elif command == "reverse old firmware":
                             client.publish(OTA_TOPIC, "reverse old firmware", qos=1)
                             print("Sent: reverse old firmware")
@@ -361,23 +381,23 @@ def setup_mqtt():
     global client
     client = mqtt.Client(client_id="Python_Server_" + str(int(time.time())), protocol=mqtt.MQTTv311)
     client.username_pw_set(USERNAME, PASSWORD)
-    #client.tls_set(ca_certs=CA_CERT)
+    # client.tls_set(ca_certs=CA_CERT)  # Uncomment and update path if needed
     client.tls_set()
     client.on_connect = on_connect
     client.on_message = on_message
-    
+
     try:
         client.connect(BROKER, PORT)
         print("Connecting to MQTT broker...")
     except Exception as e:
         print(f"Failed to connect: {e}")
         exit(1)
-    
+
     mqtt_thread = threading.Thread(target=client.loop_forever, daemon=True)
     mqtt_thread.start()
     input_thread = threading.Thread(target=input_handler, daemon=True)
     input_thread.start()
-    
+
     try:
         while True:
             time.sleep(1)

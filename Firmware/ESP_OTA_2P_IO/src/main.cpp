@@ -167,7 +167,7 @@ Preferences preferences;
 bool waitingForProvisionResponse = false;
 unsigned long provisionTimeout = 1200000;
 unsigned long provisionStartTime = 0;
-const unsigned long PROVISION_REQUEST_INTERVAL = 120000;
+const unsigned long PROVISION_REQUEST_INTERVAL = 60000;
 unsigned long lastRequestTime = 0;
 String otaSignature; // Base64-encoded ECDSA signature from OTA:BEGIN
 bool otaInProgress = false;
@@ -175,6 +175,9 @@ unsigned long otaReceivedSize = 0;
 unsigned long otaTotalSize = 0;
 unsigned long chunkCount = 0;
 std::map<unsigned long, bool> receivedChunks;
+String lastAckMsg = "";                  // Stores the most recent OTA:PROGRESS message
+unsigned long lastChunkNum = 0xFFFFFFFF; // Stores the chunk number of the last acknowledgment (invalid default)
+
 esp_ota_handle_t otaHandle = 0;
 const esp_partition_t *updatePartition = NULL;
 const esp_partition_t *previousPartition = NULL;
@@ -600,9 +603,16 @@ void encryptNVSData(unsigned char *data, size_t len, unsigned char *out)
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, device_key, 256);
-    unsigned char iv[16] = {0}; // Fixed for simplicity; improve in production
-    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, len, iv, data, out);
+    unsigned char iv[16];
+    esp_fill_random(iv, 16);                    // Generate a random IV
+    size_t padded_len = ((len + 15) / 16) * 16; // Ensure length is a multiple of 16
+    unsigned char padded_data[32] = {0};
+    memcpy(padded_data, data, len);
+    pkcs7_pad(padded_data, len, 16);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv, padded_data, out);
     mbedtls_aes_free(&aes);
+    // Store the IV in NVS alongside the encrypted data
+    preferences.putBytes("user_iv", iv, 16); // Assuming called within a preferences.begin() block
 }
 
 void decryptNVSData(unsigned char *data, size_t len, unsigned char *out)
@@ -610,8 +620,14 @@ void decryptNVSData(unsigned char *data, size_t len, unsigned char *out)
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_dec(&aes, device_key, 256);
-    unsigned char iv[16] = {0};
+    unsigned char iv[16];
+    preferences.getBytes("user_iv", iv, 16); // Retrieve the stored IV
     mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, len, iv, data, out);
+    size_t unpadded_len = pkcs7_unpad(out, len); // Remove PKCS7 padding
+    if (unpadded_len < len)
+    {
+        out[unpadded_len] = '\0'; // Null-terminate the string
+    }
     mbedtls_aes_free(&aes);
 }
 
@@ -685,7 +701,7 @@ void setup()
 {
     esp_task_wdt_reset();
     SerialMon.begin(115200);
-   
+
     generateEncryptionKeys();
     sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     esp_task_wdt_init(WDT_TIMEOUT * 1000, true);
@@ -707,13 +723,13 @@ void setup()
 #endif
 
     // For debugging purpose
-  //  resetCredentials();
+    // SerialMon.println("This is Updated OTA Firmware");
+    resetCredentials();
 
     rgbLed.begin();
     rgbLed.show();
     loadCredentials();
 
-    SerialMon.println("This is Updated OTA Firmware");
     // generateTestServerKey();
     // testECDH();
 }
@@ -742,12 +758,12 @@ void loop()
     {
     case STATE_INIT_MODEM:
         if (tryStep("Initializing modem", modem.init()))
-            
-        if ( getIMEI() != "Unknown")
-        {
-            deviceUUID = getIMEI();
-            nextState(STATE_WAIT_NETWORK);
-        }
+
+            if (getIMEI() != "Unknown")
+            {
+                deviceUUID = getIMEI();
+                nextState(STATE_WAIT_NETWORK);
+            }
         break;
     case STATE_WAIT_NETWORK:
         if (tryStep("Waiting for network", modem.waitForNetwork()))
@@ -821,8 +837,15 @@ void loop()
         }
         else if (millis() - lastRequestTime >= PROVISION_REQUEST_INTERVAL)
         {
-            requestCredentialsFromServer();
-            SerialMon.printf("Provision request resent at %lu ms\n", millis());
+            if (requestCredentialsFromServer())
+            {
+                SerialMon.printf("Provision request resent successfully at %lu ms\n", millis());
+            }
+            else
+            {
+                SerialMon.printf("Provision request failed at %lu ms, will retry after interval\n", millis());
+            }
+            lastRequestTime = millis(); //
         }
         break;
     case STATE_RUNNING:
@@ -830,7 +853,7 @@ void loop()
         {
             monitorConnections();
             lastMonitorTime = millis();
-            SerialMon.println("This is Updated OTA Firmware");
+            // SerialMon.println("This is Updated OTA Firmware");
         }
         break;
     case STATE_ERROR:
@@ -1076,6 +1099,8 @@ void cleanupResources()
         otaReceivedSize = 0;
         otaTotalSize = 0;
         chunkCount = 0;
+        lastAckMsg = ""; // Clear last acknowledgment
+        lastChunkNum = 0xFFFFFFFF;
         receivedChunks.clear();
     }
 }
@@ -1229,15 +1254,6 @@ bool setupMQTT()
             mqttStatus.serviceStarted = true;
             SerialMon.println("MQTT service started successfully");
         }
-        else
-        {
-            SerialMon.println("Unexpected response to AT+CMQTTSTART: " + response);
-            return false;
-        }
-    }
-    else
-    {
-        SerialMon.println("MQTT service already started, skipping AT+CMQTTSTART");
     }
 
     if (!mqttStatus.clientAcquired)
@@ -1251,18 +1267,60 @@ bool setupMQTT()
         SerialMon.println("Sending: " + String(accqCmd));
         SerialAT.println(accqCmd);
 
-        if (modem.waitResponse(5000L) != 1)
+        String response;
+        if (modem.waitResponse(5000L, response) != 1)
         {
-            SerialMon.println("Failed to acquire MQTT client - No OK response");
-            return false;
+            response.trim();
+            SerialMon.println("Failed to acquire MQTT client - Response: " + response);
+            if (response.indexOf("+CMQTTACCQ: 0,19") >= 0)
+            {
+                SerialMon.println("Client index 0 already acquired, attempting to release...");
+                SerialAT.println("AT+CMQTTREL=0");
+                if (modem.waitResponse(5000L) != 1)
+                {
+                    SerialMon.println("Failed to release client, attempting full MQTT restart...");
+                    if (!stopMQTT()) // Stop and reset MQTT service
+                    {
+                        SerialMon.println("MQTT stop failed, resetting modem...");
+                        resetModem();
+                        mqttStatus.reset();
+                        // Restart MQTT service after reset
+                        SerialAT.println("AT+CMQTTSTART");
+                        if (modem.waitResponse(5000L) != 1)
+                        {
+                            SerialMon.println("Failed to restart MQTT service after modem reset");
+                            return false;
+                        }
+                        mqttStatus.serviceStarted = true;
+                    }
+                    // Retry acquiring client after cleanup
+                    SerialMon.println("Retrying: " + String(accqCmd));
+                    SerialAT.println(accqCmd);
+                    if (modem.waitResponse(5000L, response) != 1 || response.indexOf("+CMQTTACCQ: 0,0") < 0)
+                    {
+                        SerialMon.println("Failed to acquire client after cleanup - Response: " + response);
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Successfully released, retry acquiring
+                    SerialMon.println("Client released, retrying: " + String(accqCmd));
+                    SerialAT.println(accqCmd);
+                    if (modem.waitResponse(5000L, response) != 1 || response.indexOf("+CMQTTACCQ: 0,0") < 0)
+                    {
+                        SerialMon.println("Failed to acquire client after release - Response: " + response);
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                return false; // Other errors
+            }
         }
-        // Assume success if OK is received; URC is optional per SIM7600 manual
         mqttStatus.clientAcquired = true;
-        SerialMon.println("MQTT client acquired successfully (OK received)");
-    }
-    else
-    {
-        SerialMon.println("MQTT client already acquired, skipping AT+CMQTTACCQ");
+        SerialMon.println("MQTT client acquired successfully");
     }
 
     if (!mqttStatus.connected)
@@ -1699,6 +1757,8 @@ void startOTA(uint32_t totalSize)
     otaReceivedSize = 0;
     chunkCount = 0;
     receivedChunks.clear();
+    lastAckMsg = ""; // Reset last acknowledgment
+    lastChunkNum = 0xFFFFFFFF;
     mbedtls_sha256_init(&sha256_ctx);
     mbedtls_sha256_starts(&sha256_ctx, 0);
     publishMQTT(mqtt_topic_send, "OTA:STARTED");
@@ -1746,19 +1806,37 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
                              ((unsigned long)decodedPayload[2] << 8) |
                              decodedPayload[3];
     size_t chunkSize = decodedLen - 4;
+
     if (receivedChunks[chunkNum])
     {
         SerialMon.println("Duplicate chunk: " + String(chunkNum));
+        if (chunkNum == lastChunkNum && lastAckMsg != "")
+        {
+            // Resend the last acknowledgment if it matches the duplicate chunk
+            publishMQTT(mqtt_topic_send, lastAckMsg.c_str());
+            SerialMon.println("Resent last ack: " + lastAckMsg);
+        }
+        else
+        {
+            SerialMon.println("Duplicate chunk " + String(chunkNum) + " does not match last chunk " + String(lastChunkNum) + "; no ack resent");
+        }
         delete[] decodedPayload;
         return;
     }
+
+    // Process new chunk
     esp_ota_write(otaHandle, decodedPayload + 4, chunkSize);
     mbedtls_sha256_update(&sha256_ctx, decodedPayload + 4, chunkSize);
     receivedChunks[chunkNum] = true;
     otaReceivedSize += chunkSize;
     chunkCount++;
-    String ackMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize) + ":DEVICE:" + clientID;
-    publishMQTT(mqtt_topic_send, ackMsg.c_str());
+
+    // Construct and store the acknowledgment message
+    lastAckMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize) + ":DEVICE:" + clientID;
+    lastChunkNum = chunkNum; // Update the last chunk number
+    publishMQTT(mqtt_topic_send, lastAckMsg.c_str());
+    SerialMon.println("Sent ack: " + lastAckMsg);
+
     delete[] decodedPayload;
 }
 
@@ -1892,13 +1970,28 @@ void loadCredentials()
     isProvisioned = preferences.getBool("provisioned", false);
     if (isProvisioned)
     {
-        clientID = preferences.getString("device_id", DEFAULT_CLIENT_ID); // Load custom device ID
+        clientID = preferences.getString("device_id", DEFAULT_CLIENT_ID);
         unsigned char enc_user[32], dec_user[32];
         unsigned char enc_pass[32], dec_pass[32];
         preferences.getBytes("username", enc_user, 32);
         preferences.getBytes("password", enc_pass, 32);
         decryptNVSData(enc_user, 32, dec_user);
         decryptNVSData(enc_pass, 32, dec_pass);
+
+        // Debug the decrypted data
+        SerialMon.print("Decrypted username: ");
+        for (int i = 0; i < 32 && dec_user[i] != '\0'; i++)
+        {
+            SerialMon.print((char)dec_user[i]);
+        }
+        SerialMon.println();
+        SerialMon.print("Decrypted password: ");
+        for (int i = 0; i < 32 && dec_pass[i] != '\0'; i++)
+        {
+            SerialMon.print((char)dec_pass[i]);
+        }
+        SerialMon.println();
+
         mqtt_user = String((char *)dec_user);
         mqtt_pass = String((char *)dec_pass);
     }
@@ -1913,23 +2006,21 @@ void loadCredentials()
 
 void saveCredentials(String device_id, String username, String password)
 {
-    clientID = device_id; // Use server-assigned ID as MQTT client ID
+    clientID = device_id;
     mqtt_user = username;
     mqtt_pass = password;
 
     preferences.begin("device-creds", false);
-    preferences.putString("device_id", device_id); // Store the custom device ID
+    preferences.putString("device_id", device_id);
 
-    unsigned char enc_user[32], dec_user[32];
-    memset(dec_user, 0, 32);
+    unsigned char enc_user[32], dec_user[32] = {0};
     memcpy(dec_user, mqtt_user.c_str(), min(mqtt_user.length(), (size_t)32));
-    encryptNVSData(dec_user, 32, enc_user);
+    encryptNVSData(dec_user, mqtt_user.length(), enc_user);
     preferences.putBytes("username", enc_user, 32);
 
-    unsigned char enc_pass[32], dec_pass[32];
-    memset(dec_pass, 0, 32);
+    unsigned char enc_pass[32], dec_pass[32] = {0};
     memcpy(dec_pass, mqtt_pass.c_str(), min(mqtt_pass.length(), (size_t)32));
-    encryptNVSData(dec_pass, 32, enc_pass);
+    encryptNVSData(dec_pass, mqtt_pass.length(), enc_pass);
     preferences.putBytes("password", enc_pass, 32);
 
     preferences.putBool("provisioned", true);
@@ -1941,17 +2032,23 @@ bool requestCredentialsFromServer()
 {
     preferences.begin("device-creds", false);
     bool hasPendingNonce = preferences.isKey("nonce");
+    bool sentRequest = false;
 
+    // Try reusing existing nonce and keys if available
     if (hasPendingNonce && waitingForProvisionResponse)
     {
-        // Reuse existing nonce and keys
         unsigned char nonce[16];
         unsigned char priv_key[32];
         preferences.getBytes("nonce", nonce, 16);
         preferences.getBytes("ecdh_priv", priv_key, 32);
         String nonceStr = base64_encode(nonce, 16);
 
-        // Load public key from stored private key
+        // Log stored private key for debugging
+        SerialMon.print("Loaded private key from NVS: ");
+        for (int i = 0; i < 32; i++)
+            SerialMon.printf("%02x", priv_key[i]);
+        SerialMon.println();
+
         mbedtls_ecdh_context ecdh;
         mbedtls_ctr_drbg_context ctr_drbg;
         mbedtls_entropy_context entropy;
@@ -1959,88 +2056,82 @@ bool requestCredentialsFromServer()
         mbedtls_ctr_drbg_init(&ctr_drbg);
         mbedtls_entropy_init(&entropy);
 
+        // Attempt to regenerate public key
+        bool regenerationSuccess = true;
         if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0) != 0)
         {
             SerialMon.println("Failed to seed DRBG");
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return false;
+            regenerationSuccess = false;
         }
-
-        if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+        else if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
         {
             SerialMon.println("Failed to load curve");
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return false;
+            regenerationSuccess = false;
         }
-
-        if (mbedtls_mpi_read_binary(&ecdh.d, priv_key, 32) != 0)
+        else if (mbedtls_mpi_read_binary(&ecdh.d, priv_key, 32) != 0)
         {
             SerialMon.println("Failed to load private key from NVS");
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return false;
+            regenerationSuccess = false;
         }
-
-        // Generate public key into a buffer
-        unsigned char pubkey_buf[65]; // 0x04 + 32 bytes X + 32 bytes Y
-        size_t olen;
-        if (mbedtls_ecdh_make_public(&ecdh, &olen, pubkey_buf, sizeof(pubkey_buf),
-                                     mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
+        else
         {
-            SerialMon.println("Failed to regenerate public key from stored private key");
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return false;
+            unsigned char pubkey_buf[65];
+            size_t olen;
+            int ret = mbedtls_ecdh_make_public(&ecdh, &olen, pubkey_buf, sizeof(pubkey_buf),
+                                               mbedtls_ctr_drbg_random, &ctr_drbg);
+            if (ret != 0)
+            {
+                SerialMon.println("Failed to regenerate public key from stored private key, error code: " + String(ret));
+                regenerationSuccess = false;
+            }
+            else if (olen != 65 || pubkey_buf[0] != 0x04)
+            {
+                SerialMon.println("Invalid public key format");
+                regenerationSuccess = false;
+            }
+            else
+            {
+                String pubkey_b64 = base64_encode(pubkey_buf, 65);
+                String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
+
+                if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
+                {
+                    SerialMon.println("Resent provision request with stored nonce");
+                    sentRequest = true;
+                }
+                else
+                {
+                    SerialMon.println("Failed to resend provision request with stored nonce");
+                }
+            }
         }
 
-        // Ensure the output is in uncompressed format (0x04 prefix)
-        if (olen != 65 || pubkey_buf[0] != 0x04)
-        {
-            SerialMon.println("Invalid public key format");
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return false;
-        }
-
-        String pubkey_b64 = base64_encode(pubkey_buf, 65);
-
-        String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
-        if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
-        {
-            SerialMon.println("Resent provision request with stored nonce");
-            lastRequestTime = millis();
-            mbedtls_entropy_free(&entropy);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_ecdh_free(&ecdh);
-            preferences.end();
-            return true;
-        }
-
-        SerialMon.println("Failed to resend provision request");
         mbedtls_entropy_free(&entropy);
         mbedtls_ctr_drbg_free(&ctr_drbg);
         mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
+
+        if (sentRequest)
+        {
+            preferences.end();
+            lastRequestTime = millis(); // Update only on success
+            return true;
+        }
+        else if (!regenerationSuccess)
+        {
+            SerialMon.println("Regeneration failed, falling back to new key generation");
+            // Proceed to generate new keys below
+        }
+        else
+        {
+            preferences.end();
+            return false; // Failed to send but no regeneration error
+        }
     }
 
-    // Generate new nonce and keys if no pending request
+    // Generate new nonce and keys if no pending request or regeneration failed
     mbedtls_ecdh_context ecdh;
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_entropy_context entropy;
-
     mbedtls_ecdh_init(&ecdh);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
@@ -2048,105 +2139,74 @@ bool requestCredentialsFromServer()
     if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0) != 0)
     {
         SerialMon.println("Failed to seed DRBG");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
     }
-
-    if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
+    else if (mbedtls_ecp_group_load(&ecdh.grp, MBEDTLS_ECP_DP_SECP256R1) != 0)
     {
         SerialMon.println("Failed to load curve");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
     }
-
-    if (mbedtls_ecdh_gen_public(&ecdh.grp, &ecdh.d, &ecdh.Q, mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
+    else if (mbedtls_ecdh_gen_public(&ecdh.grp, &ecdh.d, &ecdh.Q, mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
     {
         SerialMon.println("Failed to generate public key");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
     }
-
-    if (mbedtls_ecp_check_privkey(&ecdh.grp, &ecdh.d) != 0)
+    else
     {
-        SerialMon.println("Generated private key is invalid");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
+        unsigned char pubkey[65];
+        pubkey[0] = 0x04;
+        if (mbedtls_mpi_write_binary(&ecdh.Q.X, pubkey + 1, 32) != 0 ||
+            mbedtls_mpi_write_binary(&ecdh.Q.Y, pubkey + 33, 32) != 0)
+        {
+            SerialMon.println("Failed to serialize public key");
+        }
+        else
+        {
+            String pubkey_b64 = base64_encode(pubkey, 65);
+
+            unsigned char priv_key[32];
+            if (mbedtls_mpi_write_binary(&ecdh.d, priv_key, 32) != 0)
+            {
+                SerialMon.println("Failed to serialize private key");
+            }
+            else
+            {
+                unsigned char nonce[16];
+                esp_fill_random(nonce, 16);
+                String nonceStr = base64_encode(nonce, 16);
+
+                String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
+
+                if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
+                {
+                    waitingForProvisionResponse = true;
+                    provisionStartTime = millis();
+                    lastRequestTime = millis();
+                    preferences.putBytes("ecdh_priv", priv_key, 32);
+                    preferences.putBytes("nonce", nonce, 16);
+                    SerialMon.println("Private key and nonce stored in NVS");
+                    sentRequest = true;
+                }
+                else
+                {
+                    SerialMon.println("Failed to send new provision request");
+                }
+            }
+        }
     }
 
-    unsigned char pubkey[65];
-    pubkey[0] = 0x04;
-    if (mbedtls_mpi_write_binary(&ecdh.Q.X, pubkey + 1, 32) != 0 ||
-        mbedtls_mpi_write_binary(&ecdh.Q.Y, pubkey + 33, 32) != 0)
-    {
-        SerialMon.println("Failed to serialize public key");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
-    }
-    String pubkey_b64 = base64_encode(pubkey, 65);
-
-    unsigned char priv_key[32];
-    if (mbedtls_mpi_write_binary(&ecdh.d, priv_key, 32) != 0)
-    {
-        SerialMon.println("Failed to serialize private key");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        preferences.end();
-        return false;
-    }
-    SerialMon.print("Storing private key: ");
-    for (int i = 0; i < 32; i++)
-        SerialMon.printf("%02x", priv_key[i]);
-    SerialMon.println();
-
-    unsigned char nonce[16];
-    esp_fill_random(nonce, 16);
-    String nonceStr = base64_encode(nonce, 16);
-
-    String requestMsg = "UUID:" + deviceUUID + ":NONCE:" + nonceStr + ":PUBKEY:" + pubkey_b64;
-
-    if (publishMQTT(PROVISION_TOPIC, requestMsg.c_str()))
-    {
-        waitingForProvisionResponse = true;
-        provisionStartTime = millis();
-        lastRequestTime = millis();
-        preferences.putBytes("ecdh_priv", priv_key, 32);
-        preferences.putBytes("nonce", nonce, 16);
-        preferences.end();
-        SerialMon.println("Private key and nonce stored in NVS");
-        mbedtls_entropy_free(&entropy);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_ecdh_free(&ecdh);
-        return true;
-    }
-
-    SerialMon.println("Failed to request credentials");
     mbedtls_entropy_free(&entropy);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_ecdh_free(&ecdh);
     preferences.end();
-    return false;
+    return sentRequest;
 }
 
 /*
 
 
 provisioning okay
+password
+1234567890abcdef
+Full erase ESP32
+esptool.exe --chip esp32s3 --port COM3 erase_flash
 
 
 */
