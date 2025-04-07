@@ -113,6 +113,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     else:
         print(f"Connection failed with code {rc}")
 
+
 def on_message(client, userdata, msg):
     global last_chunk_sent, ota_in_progress, chunk_ack_event, acknowledged_chunks
     payload = msg.payload.decode('utf-8')
@@ -169,6 +170,7 @@ def on_message(client, userdata, msg):
             ota_in_progress = False
             chunk_ack_event.set()
 
+
 def send_ota_firmware(file_path):
     global last_chunk_sent, chunk_buffer, ota_in_progress, acknowledged_chunks
     MAX_RETRIES = 3
@@ -183,6 +185,7 @@ def send_ota_firmware(file_path):
         file_size = os.path.getsize(file_path)
         print(f"File size: {file_size} bytes")
         total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        print(f"Total chunks to send: {total_chunks}")
 
         with open(file_path, "rb") as f:
             magic_byte = f.read(1)
@@ -213,20 +216,21 @@ def send_ota_firmware(file_path):
             chunk_num = 0
             total_bytes_sent = 0
             chunk_buffer.clear()
-            acknowledged_chunks.clear()  # Reset for this OTA session
+            acknowledged_chunks.clear()
 
             print("Starting chunk transmission...")
             while chunk_num < total_chunks and ota_in_progress:
                 remaining_bytes = file_size - total_bytes_sent
+                if remaining_bytes < 0:
+                    print(f"Error: total_bytes_sent ({total_bytes_sent}) exceeds file_size ({file_size})")
+                    break
+                
                 chunk_size = min(CHUNK_SIZE, remaining_bytes)
                 chunk = f.read(chunk_size)
-                if not chunk:
+                
+                if len(chunk) == 0:  # Check if we actually read data
                     print(f"Error: No data read for chunk {chunk_num} at {total_bytes_sent} bytes")
                     break
-
-                # Pad the chunk if it's smaller than CHUNK_SIZE and not the last chunk
-                if len(chunk) < CHUNK_SIZE and chunk_num < total_chunks - 1:
-                    chunk += b'\x00' * (CHUNK_SIZE - len(chunk))
 
                 chunk_data = chunk_num.to_bytes(4, byteorder='big') + chunk
                 encoded_chunk = base64.b64encode(chunk_data).decode('utf-8')
@@ -261,7 +265,6 @@ def send_ota_firmware(file_path):
                     print(f"Current acknowledged chunks: {len(acknowledged_chunks)}/{total_chunks}")
                     if not chunk_ack_event.wait(timeout=FINAL_CONFIRMATION_TIMEOUT):
                         print(f"Timeout waiting for acknowledgment, {len(acknowledged_chunks)}/{total_chunks} chunks confirmed")
-                        # Request missing chunks
                         missing_chunks = [i for i in range(total_chunks) if i not in acknowledged_chunks]
                         if missing_chunks:
                             missing_str = ",".join(map(str, missing_chunks))
@@ -371,7 +374,12 @@ def input_handler():
 
 def setup_mqtt():
     global client
-    client = mqtt.Client(client_id="Python_Server_" + str(int(time.time())), protocol=mqtt.MQTTv311)
+    # Update to use callback_api_version parameter instead of deprecated version
+    client = mqtt.Client(
+        client_id="Python_Server_" + str(int(time.time())),
+        protocol=mqtt.MQTTv311,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+    )
     client.username_pw_set(USERNAME, PASSWORD)
     # client.tls_set(ca_certs=CA_CERT)  # Uncomment and update path if needed
     client.tls_set()

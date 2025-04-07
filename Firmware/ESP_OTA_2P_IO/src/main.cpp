@@ -238,6 +238,8 @@ void performFactoryReset();
 void testECDH();
 void generateTestServerKey();
 String getIMEI();
+void check_partitions();
+
 
 void resetCredentials()
 {
@@ -701,7 +703,6 @@ void setup()
 {
     esp_task_wdt_reset();
     SerialMon.begin(115200);
-
     generateEncryptionKeys();
     sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     esp_task_wdt_init(WDT_TIMEOUT * 1000, true);
@@ -724,7 +725,14 @@ void setup()
 
     // For debugging purpose
     // SerialMon.println("This is Updated OTA Firmware");
-    resetCredentials();
+    SerialMon.println("This is OLD OTA Firmware");
+
+    SerialMon.println("Running from partition: " + String(esp_ota_get_running_partition()->label));
+    previousPartition = esp_ota_get_running_partition();
+    SerialMon.println("Initial previousPartition set to: " + String(previousPartition->label));
+
+    //resetCredentials();
+    check_partitions();
 
     rgbLed.begin();
     rgbLed.show();
@@ -762,6 +770,7 @@ void loop()
             if (getIMEI() != "Unknown")
             {
                 deviceUUID = getIMEI();
+                device_id = deviceUUID; // Set device_id to IMEI
                 nextState(STATE_WAIT_NETWORK);
             }
         break;
@@ -853,7 +862,8 @@ void loop()
         {
             monitorConnections();
             lastMonitorTime = millis();
-            // SerialMon.println("This is Updated OTA Firmware");
+            //SerialMon.println("This is Updated OTA Firmware");
+            SerialMon.println("This is OLD OTA Firmware");
         }
         break;
     case STATE_ERROR:
@@ -866,6 +876,36 @@ void loop()
         if (tryStep("Recovering MQTT", connectMQTT() && subscribeMQTT()))
             nextState(STATE_RUNNING);
         break;
+    }
+}
+
+
+void check_partitions()
+{
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    SerialMon.println("Running from partition: " + String(running->label));
+    SerialMon.printf("Running partition offset: 0x%x, size: 0x%x\n", running->address, running->size);
+
+    const esp_partition_t* factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (factory) {
+        SerialMon.println("Factory partition found:");
+        SerialMon.printf("  Offset: 0x%x, Size: 0x%x\n", factory->address, factory->size);
+        uint8_t magic_byte;
+        esp_partition_read(factory, 0, &magic_byte, 1);
+        SerialMon.printf("  Magic byte: 0x%02x (%s)\n", magic_byte, magic_byte == 0xE9 ? "Valid firmware" : "No valid firmware");
+    } else {
+        SerialMon.println("Factory partition not found");
+    }
+
+    const esp_partition_t* ota_1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    if (ota_1) {
+        SerialMon.println("OTA_1 partition found:");
+        SerialMon.printf("  Offset: 0x%x, Size: 0x%x\n", ota_1->address, ota_1->size);
+        uint8_t magic_byte;
+        esp_partition_read(ota_1, 0, &magic_byte, 1);
+        SerialMon.printf("  Magic byte: 0x%02x (%s)\n", magic_byte, magic_byte == 0xE9 ? "Valid firmware" : "No valid firmware");
+    } else {
+        SerialMon.println("OTA_1 partition not found");
     }
 }
 
@@ -1028,6 +1068,24 @@ void handleMessage(String topic, String payload)
     {
         processOTAFirmware(topic, (byte *)payload.c_str(), payload.length());
     }
+    else if (topic == mqtt_topic_recv) {
+        if (payload.startsWith("RESET:SOFT:DEVICE:" + clientID)) {
+            SerialMon.println("Received soft reset command for this device");
+            publishMQTT(mqtt_topic_send, ("RESET:SOFT:CONFIRMED:DEVICE:" + clientID).c_str());
+            delay(1000); // Ensure message is sent
+            ESP.restart();
+        }
+        else if (payload.startsWith("RESET:FACTORY:DEVICE:" + clientID)) {
+            SerialMon.println("Received factory reset command for this device");
+            publishMQTT(mqtt_topic_send, ("RESET:FACTORY:CONFIRMED:DEVICE:" + clientID).c_str());
+            delay(1000); // Ensure message is sent
+            performFactoryReset();
+        }
+        else if (payload.startsWith("RESET:SOFT") || payload.startsWith("RESET:FACTORY")) {
+            SerialMon.println("Reset command received but not targeted to this device");
+        }
+    }
+
 }
 
 bool tryStep(const String &stepMsg, bool success)
@@ -1259,7 +1317,8 @@ bool setupMQTT()
     if (!mqttStatus.clientAcquired)
     {
         unsigned long timeVal = millis() & 0xFFF;
-        clientID = "ESP32_" + String(timeVal);
+        //clientID = "ESP32_" + String(timeVal);
+        clientID = "ESP32_" + deviceUUID; // Use IMEI for unique ID
         SerialMon.println("Generated clientID: " + clientID);
 
         char accqCmd[64];
@@ -1740,10 +1799,20 @@ bool stopMQTT()
 void startOTA(uint32_t totalSize)
 {
     previousPartition = esp_ota_get_running_partition();
+    if (!previousPartition)
+    {
+        SerialMon.println("Error: Could not determine running partition");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:No running partition");
+        return;
+    }
+    SerialMon.print("Running partition set as previous: ");
+    SerialMon.println(previousPartition->label);
+
     updatePartition = esp_ota_get_next_update_partition(NULL);
     if (!updatePartition)
     {
-        SerialMon.println("No OTA partition");
+        SerialMon.println("No OTA partition available");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:No update partition");
         return;
     }
     esp_err_t err = esp_ota_begin(updatePartition, totalSize, &otaHandle);
@@ -1757,7 +1826,7 @@ void startOTA(uint32_t totalSize)
     otaReceivedSize = 0;
     chunkCount = 0;
     receivedChunks.clear();
-    lastAckMsg = ""; // Reset last acknowledgment
+    lastAckMsg = "";
     lastChunkNum = 0xFFFFFFFF;
     mbedtls_sha256_init(&sha256_ctx);
     mbedtls_sha256_starts(&sha256_ctx, 0);
@@ -1768,6 +1837,14 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
 {
     String payloadStr((char *)payload, dataLen);
     SerialMon.println("Processing OTA message: " + payloadStr);
+    
+    if (payloadStr == "reverse old firmware") {
+        SerialMon.println("Received command to revert to previous firmware...");
+        revertToPreviousFirmware();
+        //publishMQTT(mqtt_topic_send, "OTA:REVERTED"); // Send confirmation to server
+        return;
+    }
+
     if (payloadStr.startsWith("OTA:BEGIN:"))
     {
         if (otaInProgress)
@@ -1938,9 +2015,32 @@ void checkMissingChunks()
 void revertToPreviousFirmware()
 {
     if (!previousPartition)
+    {
+        SerialMon.println("Error: No previous partition available to revert to");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:No previous partition");
         return;
-    esp_ota_set_boot_partition(previousPartition);
-    SerialMon.println("Reverting to previous firmware");
+    }
+
+    SerialMon.print("Current running partition: ");
+    SerialMon.println(esp_ota_get_running_partition()->label);
+    SerialMon.print("Previous partition: ");
+    SerialMon.println(previousPartition->label);
+
+    esp_err_t err = esp_ota_set_boot_partition(previousPartition);
+    if (err != ESP_OK)
+    {
+        SerialMon.printf("Error: Failed to set boot partition to previous: %s\n", esp_err_to_name(err));
+        publishMQTT(mqtt_topic_send, ("OTA:ERROR:Revert failed - " + String(esp_err_to_name(err))).c_str());
+        return;
+    }
+
+    SerialMon.println("Successfully set boot partition to previous firmware");
+    publishMQTT(mqtt_topic_send, "OTA:REVERTED");
+
+    // Small delay to ensure MQTT message is sent
+    delay(1000);
+
+    SerialMon.println("Restarting to apply previous firmware...");
     ESP.restart();
 }
 
