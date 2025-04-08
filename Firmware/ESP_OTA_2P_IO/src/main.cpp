@@ -601,37 +601,59 @@ String decryptMessage(const char *encryptedBase64, const unsigned char *iv)
     return result;
 }
 
-void encryptNVSData(unsigned char *data, size_t len, unsigned char *out)
+void encryptNVSData(unsigned char *data, size_t len, unsigned char *out, unsigned char *iv)
 {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, device_key, 256);
-    unsigned char iv[16];
-    esp_fill_random(iv, 16);                    // Generate a random IV
-    size_t padded_len = ((len + 15) / 16) * 16; // Ensure length is a multiple of 16
+
+    // Always pad to at least 32 bytes (two blocks) for CBC
+    size_t padded_len = ((len + 15) / 16 + 1) * 16; // Ensure at least two blocks
+    if (padded_len > 32) padded_len = 32; // Cap at 32 bytes for our buffer
     unsigned char padded_data[32] = {0};
     memcpy(padded_data, data, len);
     pkcs7_pad(padded_data, len, 16);
+
+    SerialMon.print("Encrypting data: ");
+    for (size_t i = 0; i < padded_len; i++) SerialMon.printf("%02x ", padded_data[i]);
+    SerialMon.println();
+    SerialMon.print("With IV: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", iv[i]);
+    SerialMon.println();
+
     mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv, padded_data, out);
+    SerialMon.print("Encrypted output: ");
+    for (size_t i = 0; i < padded_len; i++) SerialMon.printf("%02x ", out[i]);
+    SerialMon.println();
+
     mbedtls_aes_free(&aes);
-    // Store the IV in NVS alongside the encrypted data
-    preferences.putBytes("user_iv", iv, 16); // Assuming called within a preferences.begin() block
 }
 
-void decryptNVSData(unsigned char *data, size_t len, unsigned char *out)
+void decryptNVSData(unsigned char *data, size_t len, unsigned char *out, unsigned char *iv)
 {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_dec(&aes, device_key, 256);
-    unsigned char iv[16];
-    preferences.getBytes("user_iv", iv, 16); // Retrieve the stored IV
+
+    SerialMon.print("Decrypting data: ");
+    for (size_t i = 0; i < len; i++) SerialMon.printf("%02x ", data[i]);
+    SerialMon.println();
+    SerialMon.print("With IV: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", iv[i]);
+    SerialMon.println();
+
     mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, len, iv, data, out);
-    size_t unpadded_len = pkcs7_unpad(out, len); // Remove PKCS7 padding
+    SerialMon.print("Decrypted output: ");
+    for (size_t i = 0; i < len; i++) SerialMon.printf("%02x ", out[i]);
+    SerialMon.println();
+
+    size_t unpadded_len = pkcs7_unpad(out, len);
     if (unpadded_len < len)
-    {
-        out[unpadded_len] = '\0'; // Null-terminate the string
-    }
-    mbedtls_aes_free(&aes);
+        out[unpadded_len] = '\0';
+    SerialMon.print("Unpadded length: "); SerialMon.println(unpadded_len);
+    SerialMon.print("Unpadded data: ");
+    for (size_t i = 0; i < unpadded_len; i++) SerialMon.printf("%02x ", out[i]);
+    SerialMon.println();
 }
 
 bool verifyOTASignature(const unsigned char *firmware, size_t len, const unsigned char *signature, size_t sig_len)
@@ -704,7 +726,19 @@ void setup()
 {
     esp_task_wdt_reset();
     SerialMon.begin(115200);
+
     generateEncryptionKeys();
+    preferences.begin("device-creds", false);
+    if (preferences.getBytes("device_key", device_key, 32) != 32) {
+        esp_fill_random(device_key, 32); // Generate new key
+        preferences.putBytes("device_key", device_key, 32);
+    }
+    preferences.end();
+
+    SerialMon.print("Loaded device_key: ");
+    for (int i = 0; i < 32; i++) SerialMon.printf("%02x", device_key[i]);
+    SerialMon.println();
+
     sim7600.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     esp_task_wdt_init(WDT_TIMEOUT * 1000, true);
     esp_task_wdt_add(NULL);
@@ -725,7 +759,7 @@ void setup()
 #endif
 
     // For debugging purpose
-    // SerialMon.println("This is Updated OTA Firmware");
+    //SerialMon.println("This is Updated OTA Firmware");
     SerialMon.println("This is OLD OTA Firmware");
 
     SerialMon.println("Running from partition: " + String(esp_ota_get_running_partition()->label));
@@ -1049,15 +1083,17 @@ void handleMessage(String topic, String payload)
             String username = creds.substring(usernameStart + 10, passwordStart);
             String password = creds.substring(passwordStart + 10);
 
+            preferences.begin("device-creds", false);
             String device_id_from_server = creds.substring(creds.indexOf("DEVICE_ID:") + 10, creds.indexOf(":USERNAME:"));
             saveCredentials(device_id_from_server, username, password);
             device_id = device_id_from_server; // Update device_
             clientID = device_id;
             waitingForProvisionResponse = false;
-            preferences.begin("device-creds", false);
+           
             preferences.remove("nonce");     // Clear nonce on success
             preferences.remove("ecdh_priv"); // Clear private key
             preferences.end();
+            delay(500); // Ensure NVS writes are completed before proceeding
             stopMQTT();
             nextState(STATE_SETUP_MQTT);
 
@@ -1081,6 +1117,8 @@ void handleMessage(String topic, String payload)
                 SerialMon.println("Delaying before soft reset...");
                 delay(1000);
                 SerialMon.println("Executing ESP.restart()");
+                resetModem();
+                delay(2000);
                 ESP.restart();
             } else {
                 SerialMon.println("Skipping reset due to publish failure");
@@ -1334,9 +1372,10 @@ bool setupMQTT()
 
     if (!mqttStatus.clientAcquired)
     {
-        unsigned long timeVal = millis() & 0xFFF;
+        //unsigned long timeVal = millis() & 0xFFF;
         //clientID = "ESP32_" + String(timeVal);
-        clientID = "ESP32_" + deviceUUID; // Use IMEI for unique ID
+        //clientID = "ESP32_" + deviceUUID; // Use IMEI for unique ID
+        clientID = deviceUUID;
         SerialMon.println("Generated clientID: " + clientID);
 
         char accqCmd[64];
@@ -1855,38 +1894,73 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
 {
     String payloadStr((char *)payload, dataLen);
     SerialMon.println("Processing OTA message: " + payloadStr);
-    
-    if (payloadStr == "reverse old firmware") {
-        SerialMon.println("Received command to revert to previous firmware...");
-        revertToPreviousFirmware();
-        //publishMQTT(mqtt_topic_send, "OTA:REVERTED"); // Send confirmation to server
-        return;
+    SerialMon.println("Current clientID: " + clientID); // Debug line
+
+    // Handle reverse command independently of OTA progress
+    if (payloadStr.startsWith("reverse old firmware")) 
+    {
+        String deviceSpecificCmd = "reverse old firmware:DEVICE:" + clientID;
+        if (payloadStr == "reverse old firmware" || payloadStr == deviceSpecificCmd)
+        {
+            SerialMon.println("Received command to revert to previous firmware...");
+            revertToPreviousFirmware();
+            return;
+        }
+        else
+        {
+            SerialMon.println("Reverse command ignored: Device ID mismatch or malformed");
+            return;
+        }
     }
 
+    // Handle OTA:BEGIN independently of OTA progress since it initiates the process
     if (payloadStr.startsWith("OTA:BEGIN:"))
     {
+        int deviceColon = payloadStr.indexOf(":DEVICE:");
+        if (deviceColon != -1)
+        {
+            String deviceId = payloadStr.substring(deviceColon + 8); // Extract after ":DEVICE:"
+            if (deviceId != clientID)
+            {
+                SerialMon.println("OTA:BEGIN ignored: Device ID mismatch (expected " + clientID + ", got " + deviceId + ")");
+                return;
+            }
+        }
+        // If no :DEVICE:, assume broadcast (optional; remove if your server always specifies device)
+        
         if (otaInProgress)
             cleanupResources();
         int colonIdx = payloadStr.indexOf(':', 10);
         otaTotalSize = payloadStr.substring(10, colonIdx).toInt();
         int nextColon = payloadStr.indexOf(':', colonIdx + 1);
         otaHash = payloadStr.substring(colonIdx + 1, nextColon);
-        otaSignature = payloadStr.substring(nextColon + 1); // Store the signature
+        if (deviceColon != -1)
+        {
+            otaSignature = payloadStr.substring(nextColon + 1, deviceColon); // Extract signature before :DEVICE:
+        }
+        else
+        {
+            otaSignature = payloadStr.substring(nextColon + 1); // No device ID, use full remainder
+        }
         SerialMon.println("OTA Begin - Size: " + String(otaTotalSize) + ", Hash: " + otaHash + ", Signature: " + otaSignature);
         startOTA(otaTotalSize);
         return;
     }
+
+    // Remaining OTA handling requires otaInProgress
     if (!otaInProgress)
     {
         SerialMon.println("Ignoring OTA message: OTA not in progress");
         return;
     }
+
     if (payloadStr == "OTA:END")
     {
         SerialMon.println("Received OTA:END");
         finishOTA();
         return;
     }
+
     size_t maxDecodedLen = ((dataLen + 3) / 4) * 3;
     unsigned char *decodedPayload = new unsigned char[maxDecodedLen];
     size_t decodedLen = base64_decode((char *)payload, decodedPayload, maxDecodedLen);
@@ -1907,7 +1981,6 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
         SerialMon.println("Duplicate chunk: " + String(chunkNum));
         if (chunkNum == lastChunkNum && lastAckMsg != "")
         {
-            // Resend the last acknowledgment if it matches the duplicate chunk
             publishMQTT(mqtt_topic_send, lastAckMsg.c_str());
             SerialMon.println("Resent last ack: " + lastAckMsg);
         }
@@ -1919,16 +1992,14 @@ void processOTAFirmware(const String &topic, byte *payload, unsigned int dataLen
         return;
     }
 
-    // Process new chunk
     esp_ota_write(otaHandle, decodedPayload + 4, chunkSize);
     mbedtls_sha256_update(&sha256_ctx, decodedPayload + 4, chunkSize);
     receivedChunks[chunkNum] = true;
     otaReceivedSize += chunkSize;
     chunkCount++;
 
-    // Construct and store the acknowledgment message
     lastAckMsg = "OTA:PROGRESS:" + String(chunkNum) + ":" + String(otaReceivedSize) + "/" + String(otaTotalSize) + ":DEVICE:" + clientID;
-    lastChunkNum = chunkNum; // Update the last chunk number
+    lastChunkNum = chunkNum;
     publishMQTT(mqtt_topic_send, lastAckMsg.c_str());
     SerialMon.println("Sent ack: " + lastAckMsg);
 
@@ -2032,33 +2103,58 @@ void checkMissingChunks()
 
 void revertToPreviousFirmware()
 {
-    if (!previousPartition)
+    SerialMon.println("Attempting to revert to factory firmware...");
+
+    // Log current partition information
+    const esp_partition_t *currentPartition = esp_ota_get_running_partition();
+    if (currentPartition)
     {
-        SerialMon.println("Error: No previous partition available to revert to");
-        publishMQTT(mqtt_topic_send, "OTA:ERROR:No previous partition");
+        SerialMon.println("Current running partition: " + String(currentPartition->label));
+        SerialMon.printf("Address: 0x%x, Size: 0x%x\n", currentPartition->address, currentPartition->size);
+    }
+    else
+    {
+        SerialMon.println("Error: Could not determine current running partition");
+    }
+
+    // Target the factory partition explicitly
+    const esp_partition_t *factoryPartition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (!factoryPartition)
+    {
+        SerialMon.println("Error: No factory partition available to revert to");
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:No factory partition");
         return;
     }
 
-    SerialMon.print("Current running partition: ");
-    SerialMon.println(esp_ota_get_running_partition()->label);
-    SerialMon.print("Previous partition: ");
-    SerialMon.println(previousPartition->label);
+    SerialMon.println("Factory partition: " + String(factoryPartition->label));
+    SerialMon.printf("Address: 0x%x, Size: 0x%x\n", factoryPartition->address, factoryPartition->size);
 
-    esp_err_t err = esp_ota_set_boot_partition(previousPartition);
+    // Verify the factory partition has valid firmware
+    uint8_t magicByte;
+    esp_err_t readErr = esp_partition_read(factoryPartition, 0, &magicByte, 1);
+    if (readErr != ESP_OK || magicByte != 0xE9)
+    {
+        SerialMon.printf("Error: Factory partition invalid - Read error: %s, Magic byte: 0x%02x\n", 
+                         esp_err_to_name(readErr), magicByte);
+        publishMQTT(mqtt_topic_send, "OTA:ERROR:Invalid factory firmware");
+        return;
+    }
+
+    esp_err_t err = esp_ota_set_boot_partition(factoryPartition);
     if (err != ESP_OK)
     {
-        SerialMon.printf("Error: Failed to set boot partition to previous: %s\n", esp_err_to_name(err));
+        SerialMon.printf("Error: Failed to set boot partition to factory: %s\n", esp_err_to_name(err));
         publishMQTT(mqtt_topic_send, ("OTA:ERROR:Revert failed - " + String(esp_err_to_name(err))).c_str());
         return;
     }
 
-    SerialMon.println("Successfully set boot partition to previous firmware");
+    SerialMon.println("Successfully set boot partition to factory firmware: " + String(factoryPartition->label));
     publishMQTT(mqtt_topic_send, "OTA:REVERTED");
 
     // Small delay to ensure MQTT message is sent
     delay(1000);
 
-    SerialMon.println("Restarting to apply previous firmware...");
+    SerialMon.println("Restarting to apply factory firmware...");
     ESP.restart();
 }
 
@@ -2089,26 +2185,28 @@ void loadCredentials()
     isProvisioned = preferences.getBool("provisioned", false);
     if (isProvisioned)
     {
+        SerialMon.print("Loading with device_key: ");
+        for (int i = 0; i < 32; i++) SerialMon.printf("%02x", device_key[i]);
+        SerialMon.println();
+
         clientID = preferences.getString("device_id", DEFAULT_CLIENT_ID);
-        unsigned char enc_user[32], dec_user[32];
-        unsigned char enc_pass[32], dec_pass[32];
+        unsigned char enc_user[32], dec_user[32] = {0}; // Initialize to zero
+        unsigned char enc_pass[32], dec_pass[32] = {0}; // Initialize to zero
+        unsigned char user_iv[16], pass_iv[16];
         preferences.getBytes("username", enc_user, 32);
         preferences.getBytes("password", enc_pass, 32);
-        decryptNVSData(enc_user, 32, dec_user);
-        decryptNVSData(enc_pass, 32, dec_pass);
+        preferences.getBytes("user_iv", user_iv, 16);
+        preferences.getBytes("pass_iv", pass_iv, 16);
+        decryptNVSData(enc_user, 32, dec_user, user_iv);
+        decryptNVSData(enc_pass, 32, dec_pass, pass_iv);
 
-        // Debug the decrypted data
         SerialMon.print("Decrypted username: ");
         for (int i = 0; i < 32 && dec_user[i] != '\0'; i++)
-        {
             SerialMon.print((char)dec_user[i]);
-        }
         SerialMon.println();
         SerialMon.print("Decrypted password: ");
         for (int i = 0; i < 32 && dec_pass[i] != '\0'; i++)
-        {
             SerialMon.print((char)dec_pass[i]);
-        }
         SerialMon.println();
 
         mqtt_user = String((char *)dec_user);
@@ -2129,21 +2227,75 @@ void saveCredentials(String device_id, String username, String password)
     mqtt_user = username;
     mqtt_pass = password;
 
+    SerialMon.print("Saving with device_key: ");
+    for (int i = 0; i < 32; i++) SerialMon.printf("%02x", device_key[i]);
+    SerialMon.println();
+
     preferences.begin("device-creds", false);
     preferences.putString("device_id", device_id);
 
     unsigned char enc_user[32], dec_user[32] = {0};
+    unsigned char user_iv[16], original_user_iv[16];
+    esp_fill_random(user_iv, 16);
+    memcpy(original_user_iv, user_iv, 16);
+    SerialMon.print("Generated user_iv: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", original_user_iv[i]);
+    SerialMon.println();
     memcpy(dec_user, mqtt_user.c_str(), min(mqtt_user.length(), (size_t)32));
-    encryptNVSData(dec_user, mqtt_user.length(), enc_user);
-    preferences.putBytes("username", enc_user, 32);
+    encryptNVSData(dec_user, mqtt_user.length(), enc_user, user_iv);
+    preferences.putBytes("username", enc_user, 32); // Always 32 bytes
+    preferences.putBytes("user_iv", original_user_iv, 16);
 
     unsigned char enc_pass[32], dec_pass[32] = {0};
+    unsigned char pass_iv[16], original_pass_iv[16];
+    esp_fill_random(pass_iv, 16);
+    memcpy(original_pass_iv, pass_iv, 16);
+    SerialMon.print("Generated pass_iv: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", original_pass_iv[i]);
+    SerialMon.println();
     memcpy(dec_pass, mqtt_pass.c_str(), min(mqtt_pass.length(), (size_t)32));
-    encryptNVSData(dec_pass, mqtt_pass.length(), enc_pass);
-    preferences.putBytes("password", enc_pass, 32);
+    encryptNVSData(dec_pass, mqtt_pass.length(), enc_pass, pass_iv);
+    preferences.putBytes("password", enc_pass, 32); // Always 32 bytes
+    preferences.putBytes("pass_iv", original_pass_iv, 16);
 
     preferences.putBool("provisioned", true);
+
+    // Verify immediately after writing
+    SerialMon.print("Verifying with device_key: ");
+    for (int i = 0; i < 32; i++) SerialMon.printf("%02x", device_key[i]);
+    SerialMon.println();
+
+    String verify_device_id = preferences.getString("device_id", "");
+    unsigned char verify_enc_user[32], verify_dec_user[32] = {0};
+    unsigned char verify_enc_pass[32], verify_dec_pass[32] = {0};
+    unsigned char verify_user_iv[16], verify_pass_iv[16];
+    preferences.getBytes("username", verify_enc_user, 32);
+    preferences.getBytes("password", verify_enc_pass, 32);
+    preferences.getBytes("user_iv", verify_user_iv, 16);
+    preferences.getBytes("pass_iv", verify_pass_iv, 16);
+
+    SerialMon.print("Retrieved user_iv: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", verify_user_iv[i]);
+    SerialMon.println();
+    SerialMon.print("Retrieved pass_iv: ");
+    for (int i = 0; i < 16; i++) SerialMon.printf("%02x ", verify_pass_iv[i]);
+    SerialMon.println();
+
+    decryptNVSData(verify_enc_user, 32, verify_dec_user, verify_user_iv);
+    decryptNVSData(verify_enc_pass, 32, verify_dec_pass, verify_pass_iv);
+
+    SerialMon.print("Verify device_id: "); SerialMon.println(verify_device_id);
+    SerialMon.print("Verify decrypted username: "); SerialMon.println((char *)verify_dec_user);
+    SerialMon.print("Verify decrypted password: "); SerialMon.println((char *)verify_dec_pass);
+
+    if (verify_device_id != device_id || String((char *)verify_dec_user) != username || String((char *)verify_dec_pass) != password) {
+        SerialMon.println("NVS write verification failed!");
+    } else {
+        SerialMon.println("NVS write verification succeeded.");
+    }
+
     preferences.end();
+    delay(500);
     isProvisioned = true;
 }
 
