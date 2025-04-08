@@ -150,6 +150,7 @@ LCD_I2C lcd(0x27, 16, 2);
 #else
 void *lcd = nullptr;
 #endif
+String device_id; // Now using IMEI directly
 String clientID = DEFAULT_CLIENT_ID;
 String mqtt_user = DEFAULT_USERNAME;
 String mqtt_pass = DEFAULT_PASSWORD;
@@ -1048,7 +1049,9 @@ void handleMessage(String topic, String payload)
             String username = creds.substring(usernameStart + 10, passwordStart);
             String password = creds.substring(passwordStart + 10);
 
-            saveCredentials(device_id, username, password);
+            String device_id_from_server = creds.substring(creds.indexOf("DEVICE_ID:") + 10, creds.indexOf(":USERNAME:"));
+            saveCredentials(device_id_from_server, username, password);
+            device_id = device_id_from_server; // Update device_
             clientID = device_id;
             waitingForProvisionResponse = false;
             preferences.begin("device-creds", false);
@@ -1069,20 +1072,35 @@ void handleMessage(String topic, String payload)
         processOTAFirmware(topic, (byte *)payload.c_str(), payload.length());
     }
     else if (topic == mqtt_topic_recv) {
-        if (payload.startsWith("RESET:SOFT:DEVICE:" + clientID)) {
-            SerialMon.println("Received soft reset command for this device");
-            publishMQTT(mqtt_topic_send, ("RESET:SOFT:CONFIRMED:DEVICE:" + clientID).c_str());
-            delay(1000); // Ensure message is sent
-            ESP.restart();
-        }
-        else if (payload.startsWith("RESET:FACTORY:DEVICE:" + clientID)) {
-            SerialMon.println("Received factory reset command for this device");
-            publishMQTT(mqtt_topic_send, ("RESET:FACTORY:CONFIRMED:DEVICE:" + clientID).c_str());
-            delay(1000); // Ensure message is sent
-            performFactoryReset();
-        }
-        else if (payload.startsWith("RESET:SOFT") || payload.startsWith("RESET:FACTORY")) {
-            SerialMon.println("Reset command received but not targeted to this device");
+        SerialMon.println("Processing command for device_id: " + device_id);
+        if (payload.startsWith("RESET:SOFT:DEVICE:" + device_id)) {
+            SerialMon.println("Soft reset command matched");
+            bool pubSuccess = publishMQTT(mqtt_topic_send, ("RESET:SOFT:CONFIRMED:DEVICE:" + device_id).c_str());
+            SerialMon.println("Publish confirmation result: " + String(pubSuccess ? "Success" : "Failed"));
+            if (pubSuccess) {
+                SerialMon.println("Delaying before soft reset...");
+                delay(1000);
+                SerialMon.println("Executing ESP.restart()");
+                ESP.restart();
+            } else {
+                SerialMon.println("Skipping reset due to publish failure");
+            }
+        } 
+        else if (payload.startsWith("RESET:FACTORY:DEVICE:" + device_id)) {
+            SerialMon.println("Factory reset command matched");
+            bool pubSuccess = publishMQTT(mqtt_topic_send, ("RESET:FACTORY:CONFIRMED:DEVICE:" + device_id).c_str());
+            SerialMon.println("Publish confirmation result: " + String(pubSuccess ? "Success" : "Failed"));
+            if (pubSuccess) {
+                SerialMon.println("Delaying before factory reset...");
+                delay(1000);
+                SerialMon.println("Executing performFactoryReset()");
+                performFactoryReset();
+            } else {
+                SerialMon.println("Skipping factory reset due to publish failure");
+            }
+        } 
+        else {
+            SerialMon.println("Command not applicable to this device");
         }
     }
 
@@ -2058,6 +2076,7 @@ void performFactoryReset()
     preferences.clear();
     preferences.end();
     isProvisioned = false;
+  
     clientID = DEFAULT_CLIENT_ID;
     mqtt_user = DEFAULT_USERNAME;
     mqtt_pass = DEFAULT_PASSWORD;
